@@ -408,6 +408,9 @@ pub struct ObfsConfig {
     pub decoy_enabled: bool,
     /// Decoy upstream `host:port` to reverse-proxy to.
     pub decoy_target: String,
+    /// Address the decoy proxy listens on (`ip:port`, server side). Empty =
+    /// derive from `real_ip:443`.
+    pub decoy_listen: String,
 }
 
 impl Default for ObfsConfig {
@@ -428,6 +431,7 @@ impl Default for ObfsConfig {
             cover_traffic_pps: 0,
             decoy_enabled: false,
             decoy_target: "www.cloudflare.com:443".to_string(),
+            decoy_listen: String::new(),
         }
     }
 }

@@ -25,6 +25,7 @@ use crate::crypto::{self, SessionCrypto};
 use crate::error::{Error, Result};
 use crate::fec::{FecDecoder, FecEncoder};
 use crate::mux::{self, BatchAccumulator};
+use crate::obfs::{self, Obfs};
 use crate::transport::{self, Transport};
 use crate::tun::TunDevice;
 use crate::wire::{flags, FrameType, Header, HEADER_LEN};
@@ -45,6 +46,7 @@ struct PlaneParams {
     fec_parity_shards: usize,
     shard_len: usize,
     fec_max_groups: usize,
+    obfs: Obfs,
 }
 
 impl PlaneParams {
@@ -52,8 +54,9 @@ impl PlaneParams {
         let datagram = transport_kind.supports_mux_fec();
         let mtu = cfg.perf.mtu as usize;
         let mux_max = cfg.mux.multiplex_max_payload.max(mtu);
-        // Shard must hold the largest sealed frame + the 2-byte FEC length prefix.
-        let max_frame = HEADER_LEN + mux_max.max(mtu) + crypto::TAG_LEN;
+        // Shard must hold the largest sealed frame + padding + length prefix.
+        let max_frame =
+            HEADER_LEN + mux_max.max(mtu) + crypto::TAG_LEN + cfg.obfs.packet_padding_max;
         PlaneParams {
             mtu,
             mux_enabled: datagram && cfg.mux.enable_multiplex,
@@ -65,6 +68,7 @@ impl PlaneParams {
             fec_parity_shards: cfg.fec.fec_parity_shards,
             shard_len: max_frame + 16,
             fec_max_groups: 64,
+            obfs: Obfs::from_config(cfg),
         }
     }
 }
@@ -103,6 +107,17 @@ impl Engine {
         // --- TUN ----------------------------------------------------------
         let tun = Arc::new(TunDevice::create(&cfg.tun).await?);
         info!(dev = tun.name(), mtu = tun.mtu(), "tun device up");
+
+        // --- Active-probe decoy (server) ----------------------------------
+        if role == Role::Server && cfg.obfs.decoy_enabled {
+            let listen = obfs::decoy::listen_addr(&cfg.obfs.decoy_listen, cfg.spoof.real_ip);
+            let target = cfg.obfs.decoy_target.clone();
+            tokio::spawn(async move {
+                if let Err(e) = obfs::decoy::run(listen, target).await {
+                    warn!(err = %e, "decoy reverse proxy exited");
+                }
+            });
+        }
 
         // --- Handshake ----------------------------------------------------
         let hs_params = crypto::handshake_params(&cfg)?;
@@ -256,21 +271,55 @@ fn frame_with(ftype: FrameType, body: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Seal a plaintext payload into a `Data` frame (header authenticated as AAD).
-fn seal_frame(
+/// Seal a payload into a frame (header authenticated as AAD), applying the
+/// padding policy. The `PADDED` flag is set automatically when padding applies.
+fn seal_typed(
     session: &SessionCrypto,
+    ftype: FrameType,
     counter: u64,
-    extra_flags: u8,
+    base_flags: u8,
     payload: &[u8],
+    pad: &obfs::PadPolicy,
 ) -> Result<Vec<u8>> {
-    let header = Header::new(FrameType::Data, extra_flags, session.session_id, counter);
+    let mut frame_flags = base_flags;
+    let padded = pad.apply(payload);
+    let plaintext: &[u8] = match &padded {
+        Some(p) => {
+            frame_flags |= flags::PADDED;
+            p
+        }
+        None => payload,
+    };
+
+    let header = Header::new(ftype, frame_flags, session.session_id, counter);
     let hdr = header.to_bytes();
-    let mut body = payload.to_vec();
+    let mut body = plaintext.to_vec();
     session.tx.seal(counter, &hdr, &mut body)?;
     let mut frame = Vec::with_capacity(HEADER_LEN + body.len());
     frame.extend_from_slice(&hdr);
     frame.extend_from_slice(&body);
     Ok(frame)
+}
+
+/// Seal a `Data` frame.
+fn seal_frame(
+    session: &SessionCrypto,
+    counter: u64,
+    extra_flags: u8,
+    payload: &[u8],
+    pad: &obfs::PadPolicy,
+) -> Result<Vec<u8>> {
+    seal_typed(session, FrameType::Data, counter, extra_flags, payload, pad)
+}
+
+/// Seal a `Chaff` cover-traffic frame with a random payload.
+fn seal_chaff(session: &SessionCrypto, counter: u64, pad: &obfs::PadPolicy) -> Result<Vec<u8>> {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let len = rng.gen_range(16..=256);
+    let mut body = vec![0u8; len];
+    rng.fill(&mut body[..]);
+    seal_typed(session, FrameType::Chaff, counter, 0, &body, pad)
 }
 
 /// Send a sealed frame, applying FEC if enabled.
@@ -291,7 +340,25 @@ async fn emit_frame(
     Ok(())
 }
 
-/// `tun → net`: batch (optional), encrypt, FEC (optional), send.
+/// Emit a sealed frame after an optional timing-jitter delay.
+async fn emit_with_jitter(
+    send_t: &dyn Transport,
+    fec: &mut Option<FecEncoder>,
+    frame: &[u8],
+    jitter_ms: u64,
+) {
+    let d = obfs::shaping::jitter(jitter_ms);
+    if !d.is_zero() {
+        tokio::time::sleep(d).await;
+    }
+    if let Err(e) = emit_frame(send_t, fec, frame).await {
+        warn!(err = %e, "transport send error");
+    }
+}
+
+/// `tun → net`: batch (optional) → pad → encrypt → FEC (optional) → jitter → send,
+/// plus optional cover/chaff traffic on idle slots. One task owns the tx
+/// counter, the FEC encoder and the mux accumulator (no locking in the hot path).
 async fn tun_to_net(
     tun: Arc<TunDevice>,
     send_t: Arc<dyn Transport>,
@@ -300,6 +367,8 @@ async fn tun_to_net(
 ) {
     let mut tx_counter: u64 = 0;
     let mut inbuf = vec![0u8; plane.mtu + 256];
+    let overhead = HEADER_LEN + crypto::TAG_LEN;
+    let jitter_ms = plane.obfs.timing_jitter_ms;
 
     let mut fec = if plane.fec_enabled {
         match FecEncoder::new(
@@ -318,72 +387,77 @@ async fn tun_to_net(
         None
     };
 
-    if plane.mux_enabled {
-        let mut acc = BatchAccumulator::new(plane.mux_max_payload);
-        let mut ticker = tokio::time::interval(plane.mux_flush);
-        loop {
-            tokio::select! {
-                r = tun.recv(&mut inbuf) => {
-                    let n = match r { Ok(n) => n, Err(e) => { warn!(err=%e, "tun read"); continue; } };
-                    if n == 0 { continue; }
-                    if acc.would_overflow(n) {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, &mut acc).await;
-                    }
-                    if acc.push(&inbuf[..n]).is_err() { continue; }
-                    if acc.encoded_len() >= plane.mux_max_payload {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, &mut acc).await;
-                    }
-                }
-                _ = ticker.tick() => {
-                    if !acc.is_empty() {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, &mut acc).await;
-                    }
-                }
-            }
-        }
+    let mut acc = if plane.mux_enabled {
+        Some(BatchAccumulator::new(plane.mux_max_payload))
     } else {
-        loop {
-            let n = match tun.recv(&mut inbuf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(err = %e, "tun read error");
-                    continue;
-                }
-            };
-            if n == 0 {
-                continue;
-            }
-            let counter = tx_counter;
-            tx_counter += 1;
-            match seal_frame(&session, counter, 0, &inbuf[..n]) {
-                Ok(frame) => {
-                    if let Err(e) = emit_frame(&*send_t, &mut fec, &frame).await {
-                        warn!(err = %e, "transport send error");
+        None
+    };
+    let mut mux_ticker = tokio::time::interval(plane.mux_flush);
+    let cover_on = plane.obfs.cover_pps > 0;
+    let cover_interval = if cover_on {
+        Duration::from_nanos(1_000_000_000 / plane.obfs.cover_pps.max(1))
+    } else {
+        Duration::from_secs(3600)
+    };
+    let mut cover_ticker = tokio::time::interval(cover_interval);
+
+    loop {
+        tokio::select! {
+            r = tun.recv(&mut inbuf) => {
+                let n = match r { Ok(n) => n, Err(e) => { warn!(err=%e, "tun read error"); continue; } };
+                if n == 0 { continue; }
+                if let Some(a) = &mut acc {
+                    if a.would_overflow(n) {
+                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane).await;
+                    }
+                    let _ = a.push(&inbuf[..n]);
+                    if a.encoded_len() >= plane.mux_max_payload {
+                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane).await;
+                    }
+                } else {
+                    let counter = tx_counter;
+                    tx_counter += 1;
+                    let pad = plane.obfs.frame_pad(overhead);
+                    match seal_frame(&session, counter, 0, &inbuf[..n], &pad) {
+                        Ok(frame) => emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms).await,
+                        Err(e) => warn!(err = %e, "seal failed (rekey needed?)"),
                     }
                 }
-                Err(e) => warn!(err = %e, "seal failed (rekey needed?)"),
+            }
+            _ = mux_ticker.tick(), if acc.is_some() => {
+                if let Some(a) = &mut acc {
+                    if !a.is_empty() {
+                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane).await;
+                    }
+                }
+            }
+            _ = cover_ticker.tick(), if cover_on => {
+                let counter = tx_counter;
+                tx_counter += 1;
+                let pad = plane.obfs.frame_pad(overhead);
+                if let Ok(frame) = seal_chaff(&session, counter, &pad) {
+                    emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms).await;
+                }
             }
         }
     }
 }
 
-/// Flush the mux accumulator as one batched Data frame.
+/// Flush the mux accumulator as one padded, batched Data frame.
 async fn flush_batch(
     send_t: &Arc<dyn Transport>,
     session: &Arc<SessionCrypto>,
     tx_counter: &mut u64,
     fec: &mut Option<FecEncoder>,
     acc: &mut BatchAccumulator,
+    plane: &PlaneParams,
 ) {
     let Some(batch) = acc.take() else { return };
     let counter = *tx_counter;
     *tx_counter += 1;
-    match seal_frame(session, counter, flags::MUX_BATCH, &batch) {
-        Ok(frame) => {
-            if let Err(e) = emit_frame(&**send_t, fec, &frame).await {
-                warn!(err = %e, "transport send error");
-            }
-        }
+    let pad = plane.obfs.frame_pad(HEADER_LEN + crypto::TAG_LEN);
+    match seal_frame(session, counter, flags::MUX_BATCH, &batch, &pad) {
+        Ok(frame) => emit_with_jitter(&**send_t, fec, &frame, plane.obfs.timing_jitter_ms).await,
         Err(e) => warn!(err = %e, "seal batch failed"),
     }
 }
@@ -458,17 +532,27 @@ async fn process_sealed(
             if session.rx.open(header.counter, aad, &mut body).is_err() {
                 return; // fail-closed
             }
+            // Strip padding if present, then (if batched) split.
+            let payload: &[u8] = if header.flags & flags::PADDED != 0 {
+                match obfs::padding::strip(&body) {
+                    Some(p) => p,
+                    None => return, // malformed padding trailer — drop
+                }
+            } else {
+                &body
+            };
             if header.flags & flags::MUX_BATCH != 0 {
-                if let Ok(pkts) = mux::decode_batch(&body) {
+                if let Ok(pkts) = mux::decode_batch(payload) {
                     for p in pkts {
                         let _ = tun.send(p).await;
                     }
                 }
             } else {
-                let _ = tun.send(&body).await;
+                let _ = tun.send(payload).await;
             }
         }
         FrameType::Keepalive => debug!("keepalive received"),
+        // Chaff/cover frames decrypt to nothing meaningful — drop silently.
         _ => {}
     }
 }
@@ -592,7 +676,12 @@ mod tests {
         assert!(client_sess.pq_active && server_sess.pq_active);
 
         let inner = b"\x45\x00 a tiny pretend IP packet";
-        let frame = seal_frame(&client_sess, 1, 0, inner).unwrap();
+        let no_pad = obfs::PadPolicy {
+            min: 0,
+            max: 0,
+            pad_to: 0,
+        };
+        let frame = seal_frame(&client_sess, 1, 0, inner, &no_pad).unwrap();
         client_t.send_frame(&frame).await.unwrap();
 
         let mut buf = vec![0u8; RECV_CAP];

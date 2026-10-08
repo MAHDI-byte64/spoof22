@@ -27,8 +27,8 @@ pub struct UdpTransport {
     dst: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
-    ttl: u8,
-    tos: u8,
+    ttl_pool: Vec<u8>,
+    dscp_pool: Vec<u8>,
     ip_id: IpIdCounter,
 }
 
@@ -50,8 +50,8 @@ impl UdpTransport {
             dst: p.peer_real,
             src_port: p.data_port,
             dst_port: p.data_port,
-            ttl: p.ttl,
-            tos: p.tos,
+            ttl_pool: p.ttl_pool.clone(),
+            dscp_pool: p.dscp_pool.clone(),
             ip_id: IpIdCounter::new(),
         })
     }
@@ -84,8 +84,8 @@ impl Transport for UdpTransport {
             src: self.src,
             dst: self.dst,
             protocol: 17,
-            ttl: self.ttl,
-            tos: self.tos,
+            ttl: super::pick(&self.ttl_pool, 64),
+            tos: super::pick(&self.dscp_pool, 0),
             id: self.ip_id.next(),
             payload: &seg,
         });

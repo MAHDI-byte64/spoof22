@@ -52,10 +52,10 @@ pub struct TransportParams {
     pub is_server: bool,
     /// Prepend a 5-byte fake TLS Application-Data record on the TCP transport.
     pub fake_tls: bool,
-    /// Default TTL (obfuscation may override per-packet later).
-    pub ttl: u8,
-    /// Default TOS/DSCP byte.
-    pub tos: u8,
+    /// TTL values chosen at random per packet (TTL jitter).
+    pub ttl_pool: Vec<u8>,
+    /// DSCP/TOS bytes chosen at random per packet.
+    pub dscp_pool: Vec<u8>,
     /// Socket send buffer size.
     pub sndbuf: usize,
     /// Socket receive buffer size.
@@ -76,11 +76,29 @@ impl TransportParams {
             icmp_id: cfg.transport.icmp_id,
             is_server: matches!(role, Role::Server),
             fake_tls: cfg.obfs.fake_tls_header,
-            ttl: *cfg.obfs.ttl_jitter.first().unwrap_or(&64),
-            tos: *cfg.obfs.random_dscp.first().unwrap_or(&0),
+            ttl_pool: if cfg.obfs.ttl_jitter.is_empty() {
+                vec![64]
+            } else {
+                cfg.obfs.ttl_jitter.clone()
+            },
+            dscp_pool: if cfg.obfs.random_dscp.is_empty() {
+                vec![0]
+            } else {
+                cfg.obfs.random_dscp.clone()
+            },
             sndbuf: 4 * 1024 * 1024,
             rcvbuf: 4 * 1024 * 1024,
         }
+    }
+}
+
+/// Pick a random element from a non-empty pool (falls back to `default`).
+pub fn pick(pool: &[u8], default: u8) -> u8 {
+    use rand::Rng;
+    if pool.is_empty() {
+        default
+    } else {
+        pool[rand::thread_rng().gen_range(0..pool.len())]
     }
 }
 

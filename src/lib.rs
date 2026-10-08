@@ -39,6 +39,7 @@ pub mod crypto;
 pub mod fec;
 pub mod log;
 pub mod mux;
+pub mod obfs;
 pub mod session;
 pub mod spoof;
 pub mod transport;

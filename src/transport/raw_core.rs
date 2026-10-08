@@ -19,8 +19,8 @@ pub struct RawCore {
     dst: Ipv4Addr,
     expect_src: Ipv4Addr,
     accept_any: bool,
-    ttl: u8,
-    tos: u8,
+    ttl_pool: Vec<u8>,
+    dscp_pool: Vec<u8>,
     protocol: u8,
     ip_id: IpIdCounter,
 }
@@ -35,21 +35,22 @@ impl RawCore {
             dst: p.peer_real,
             expect_src: p.peer_spoofed,
             accept_any: p.accept_any_src,
-            ttl: p.ttl,
-            tos: p.tos,
+            ttl_pool: p.ttl_pool.clone(),
+            dscp_pool: p.dscp_pool.clone(),
             protocol,
             ip_id: IpIdCounter::new(),
         })
     }
 
-    /// Build the IPv4 packet around an already-formed L4 payload and send it.
+    /// Build the IPv4 packet around an already-formed L4 payload and send it,
+    /// applying per-packet TTL jitter and DSCP marking.
     pub async fn send_l4(&self, l4: &[u8]) -> Result<()> {
         let pkt = ipv4::build(&Ipv4Build {
             src: self.src,
             dst: self.dst,
             protocol: self.protocol,
-            ttl: self.ttl,
-            tos: self.tos,
+            ttl: super::pick(&self.ttl_pool, 64),
+            tos: super::pick(&self.dscp_pool, 0),
             id: self.ip_id.next(),
             payload: l4,
         });
