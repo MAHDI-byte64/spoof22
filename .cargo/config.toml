@@ -1,0 +1,13 @@
+# Enable host-native CPU features (AVX2 / AVX-512 / NEON) for the crypto, FEC
+# and checksum paths. This is applied ONLY to the native host target, so the
+# musl / aarch64 cross-build matrix in CI is unaffected.
+#
+# To reproduce the spec's requested build explicitly:
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
+#
+# CI cross builds override this by setting CARGO_BUILD_RUSTFLAGS per target.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]

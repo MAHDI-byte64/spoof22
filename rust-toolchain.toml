@@ -1,0 +1,11 @@
+[toolchain]
+# freespoof targets stable Rust. 1.75 is the documented minimum; CI pins a
+# recent stable. `rustfmt` and `clippy` are required for the quality gates.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+]

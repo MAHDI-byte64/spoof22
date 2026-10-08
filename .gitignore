@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+# Build/run artifacts
+/dist
+*.log
+# Generated QUIC certs (runtime)
+*.pem.local
+# Local operator overrides
+config/*.local.toml
+# fuzz build artifacts
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

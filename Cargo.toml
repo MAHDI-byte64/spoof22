@@ -1,0 +1,127 @@
+[package]
+name = "freespoof"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "freespoof — a bidirectional IP-spoofing, DPI-resistant point-to-point tunnel for authorized anti-censorship use on operator-controlled links."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/mahdi-byte64/spoof22"
+authors = ["freespoof authors"]
+# `freespoof` is the unified binary (role = client | server). `freespoof-client`
+# and `freespoof-server` are thin role-locked entry points over the same library.
+default-run = "freespoof"
+
+[lib]
+name = "freespoof"
+path = "src/lib.rs"
+
+[[bin]]
+name = "freespoof"
+path = "src/cmd/freespoof.rs"
+
+[[bin]]
+name = "freespoof-client"
+path = "src/cmd/freespoof_client.rs"
+
+[[bin]]
+name = "freespoof-server"
+path = "src/cmd/freespoof_server.rs"
+
+[dependencies]
+# --- Global allocator -------------------------------------------------------
+mimalloc = { version = "0.1", default-features = false }
+
+# --- Async runtime ----------------------------------------------------------
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "macros",
+    "fs",
+    "process",
+] }
+futures = "0.3"
+async-trait = "0.1"
+
+# --- Cryptography (all vetted crates; nothing hand-rolled) ------------------
+snow = "0.10"                                   # Noise Protocol framework (IK, X25519)
+chacha20poly1305 = "0.11"                       # per-frame AEAD
+aes-gcm = "0.11"                                # per-frame AEAD when hardware AES present
+ml-kem = "0.2"                                  # FIPS-203 ML-KEM for the post-quantum hybrid
+hkdf = "0.12"                                   # key-schedule derivation (hybrid key mixing, rekey)
+sha2 = "0.10"                                   # HKDF hash + misc
+blake2 = "0.10"                                 # fast hashing for IP-ID / shaping helpers
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"                                    # constant-time comparisons
+rand = "0.8"
+getrandom = "0.2"
+
+# --- QUIC + TLS (ring backend keeps musl/static builds simple) --------------
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rcgen = { version = "0.14", default-features = false, features = [
+    "crypto",
+    "ring",
+    "pem",
+] }
+
+# --- FEC --------------------------------------------------------------------
+reed-solomon-erasure = "6"
+
+# --- Config / serialization -------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+# --- Errors -----------------------------------------------------------------
+thiserror = "2"
+anyhow = "1"
+
+# --- Logging / observability ------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "json"] }
+prometheus = { version = "0.14", default-features = false }
+
+# --- CLI --------------------------------------------------------------------
+clap = { version = "4", features = ["derive", "env"] }
+
+# --- Low-level networking / system -----------------------------------------
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+
+# --- Data structures / utilities --------------------------------------------
+bytes = "1"
+arc-swap = "1"
+parking_lot = "0.12"
+hex = "0.4"
+base64 = "0.23"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"      # graceful degradation: one tunnel failing must not abort the process
+debug = false
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+
+# NOTE: Criterion `[[bench]]` targets are declared in the testing milestone,
+# once benches/*.rs exist, to keep every intermediate `cargo build` green.
