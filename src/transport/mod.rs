@@ -10,6 +10,13 @@
 //! Milestone 1 ships the UDP transport; the remaining six arrive in
 //! milestone 2 (and are wired into [`build`] there).
 
+pub mod gre;
+pub mod icmp;
+pub mod ipip;
+pub mod proto58;
+pub mod quic;
+pub mod raw_core;
+pub mod tcp;
 pub mod udp;
 
 use std::sync::Arc;
@@ -17,7 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::config::{Config, Role, TransportKind};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// Common parameters every raw transport needs, derived from config + role.
 #[derive(Debug, Clone)]
@@ -28,12 +35,23 @@ pub struct TransportParams {
     pub forged_src: std::net::Ipv4Addr,
     /// The peer's real destination address.
     pub peer_real: std::net::Ipv4Addr,
-    /// Our real address (for binding receive sockets).
+    /// The peer's forged source as we expect to *see* it on inbound packets
+    /// (used only to filter noise; authentication is cryptographic). Equals
+    /// `peer_real` in no-spoof mode.
+    pub peer_spoofed: std::net::Ipv4Addr,
+    /// Our real address (for binding receive sockets / dst filtering).
     pub real_ip: std::net::Ipv4Addr,
+    /// Accept any inbound source (probe mode `--check-allow-any`).
+    pub accept_any_src: bool,
     /// L4 port (udp/tcp/quic).
     pub data_port: u16,
     /// ICMP identifier (icmp transport).
     pub icmp_id: u16,
+    /// True on the server side (used by ICMP to send Echo *Reply* so the flow
+    /// looks like a genuine ping request/reply exchange).
+    pub is_server: bool,
+    /// Prepend a 5-byte fake TLS Application-Data record on the TCP transport.
+    pub fake_tls: bool,
     /// Default TTL (obfuscation may override per-packet later).
     pub ttl: u8,
     /// Default TOS/DSCP byte.
@@ -46,14 +64,18 @@ pub struct TransportParams {
 
 impl TransportParams {
     /// Derive transport parameters from a validated config.
-    pub fn from_config(cfg: &Config, _role: Role) -> TransportParams {
+    pub fn from_config(cfg: &Config, role: Role) -> TransportParams {
         TransportParams {
             interface: cfg.transport.interface.clone(),
             forged_src: cfg.spoof.spoofed_ip,
             peer_real: cfg.spoof.peer_real_ip,
+            peer_spoofed: cfg.spoof.peer_spoofed_ip,
             real_ip: cfg.spoof.real_ip,
+            accept_any_src: false,
             data_port: cfg.transport.data_port,
             icmp_id: cfg.transport.icmp_id,
+            is_server: matches!(role, Role::Server),
+            fake_tls: cfg.obfs.fake_tls_header,
             ttl: *cfg.obfs.ttl_jitter.first().unwrap_or(&64),
             tos: *cfg.obfs.random_dscp.first().unwrap_or(&0),
             sndbuf: 4 * 1024 * 1024,
@@ -75,14 +97,19 @@ pub trait Transport: Send + Sync {
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize>;
 }
 
-/// Build a transport of `kind` from the given parameters.
-pub async fn build(kind: TransportKind, params: &TransportParams) -> Result<Arc<dyn Transport>> {
+/// Build a transport of `kind` for this side.
+///
+/// The raw transports derive their parameters from the config; QUIC needs the
+/// full config (cert paths, SNI, windows) and establishes its connection here.
+pub async fn build(kind: TransportKind, cfg: &Config, role: Role) -> Result<Arc<dyn Transport>> {
+    let params = TransportParams::from_config(cfg, role);
     match kind {
-        TransportKind::Udp => Ok(Arc::new(udp::UdpTransport::bind(params).await?)),
-        // The remaining transports are implemented in milestone 2.
-        other => Err(Error::transport(
-            other.as_str(),
-            "transport not available in this build milestone (milestone 2 adds it)",
-        )),
+        TransportKind::Udp => Ok(Arc::new(udp::UdpTransport::bind(&params).await?)),
+        TransportKind::Icmp => Ok(Arc::new(icmp::IcmpTransport::new(&params)?)),
+        TransportKind::Proto58 => Ok(Arc::new(proto58::Proto58Transport::new(&params)?)),
+        TransportKind::Ipip => Ok(Arc::new(ipip::IpipTransport::new(&params)?)),
+        TransportKind::Gre => Ok(Arc::new(gre::GreTransport::new(&params)?)),
+        TransportKind::Tcp => Ok(Arc::new(tcp::TcpTransport::new(&params)?)),
+        TransportKind::Quic => Ok(Arc::new(quic::QuicTransport::establish(cfg, role).await?)),
     }
 }
