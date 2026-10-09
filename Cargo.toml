@@ -122,5 +122,14 @@ strip = true
 opt-level = 3
 lto = "thin"
 
-# NOTE: Criterion `[[bench]]` targets are declared in the testing milestone,
-# once benches/*.rs exist, to keep every intermediate `cargo build` green.
+[[bench]]
+name = "crypto_bench"
+harness = false
+
+[[bench]]
+name = "fec_bench"
+harness = false
+
+[[bench]]
+name = "mux_bench"
+harness = false

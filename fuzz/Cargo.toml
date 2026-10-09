@@ -1,0 +1,29 @@
+# cargo-fuzz crate for the packet-decode attack surface.
+# Run with:  cargo +nightly fuzz run parse_frame
+#
+# This is a standalone crate (not part of the main build); it depends on the
+# parent `freespoof` library and exercises every untrusted-input parser.
+[package]
+name = "freespoof-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.freespoof]
+path = ".."
+
+[[bin]]
+name = "parse_frame"
+path = "fuzz_targets/parse_frame.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
