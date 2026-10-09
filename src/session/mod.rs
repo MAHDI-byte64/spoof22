@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::fec::{FecDecoder, FecEncoder};
 use crate::mux::{self, BatchAccumulator};
 use crate::obfs::{self, Obfs};
+use crate::reliability::Backoff;
 use crate::transport::{self, Transport};
 use crate::tun::TunDevice;
 use crate::wire::{flags, FrameType, Header, HEADER_LEN};
@@ -47,6 +48,12 @@ struct PlaneParams {
     shard_len: usize,
     fec_max_groups: usize,
     obfs: Obfs,
+    keepalive_secs: u64,
+    dead_secs: u64,
+    migration: bool,
+    data_port: u16,
+    is_server: bool,
+    replay_window: u32,
 }
 
 impl PlaneParams {
@@ -69,6 +76,58 @@ impl PlaneParams {
             shard_len: max_frame + 16,
             fec_max_groups: 64,
             obfs: Obfs::from_config(cfg),
+            keepalive_secs: cfg.reliability.keepalive_secs,
+            dead_secs: cfg.reliability.dead_peer_timeout_secs,
+            migration: cfg.reliability.enable_migration,
+            data_port: cfg.transport.data_port,
+            is_server: matches!(cfg.role, Role::Server),
+            replay_window: cfg.crypto.replay_window,
+        }
+    }
+}
+
+/// Shared liveness state between the data-plane tasks and the supervisor.
+#[derive(Clone)]
+struct Life {
+    /// Wall-clock millis of the last inbound frame.
+    last_rx: Arc<std::sync::atomic::AtomicU64>,
+    /// Notified once when the session should end (dead peer / fatal error).
+    ended: Arc<tokio::sync::Notify>,
+}
+
+impl Life {
+    fn new() -> Life {
+        Life {
+            last_rx: Arc::new(std::sync::atomic::AtomicU64::new(unix_millis())),
+            ended: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+    fn mark_rx(&self) {
+        self.last_rx
+            .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+    fn last_rx_ms(&self) -> u64 {
+        self.last_rx.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn end(&self) {
+        self.ended.notify_one();
+    }
+}
+
+/// Wall-clock milliseconds, used for liveness and the hop schedule.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Aborts its tasks when dropped — guarantees data-plane cleanup on shutdown.
+struct AbortGuard(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
         }
     }
 }
@@ -84,31 +143,17 @@ impl Engine {
         Engine { cfg }
     }
 
-    /// Run until a shutdown signal (SIGINT/SIGTERM) arrives.
+    /// Run until a shutdown signal (SIGINT/SIGTERM) arrives, reconnecting with
+    /// backoff/failover as needed.
     pub async fn run(self) -> Result<()> {
-        let cfg = self.cfg;
+        let cfg = Arc::new(self.cfg);
         let role = cfg.role;
 
-        // --- Transports (send = uplink, recv = downlink) ------------------
-        let up = cfg.transport.uplink_protocol;
-        let down = cfg.transport.downlink_protocol;
-        let send_t = transport::build(up, &cfg, role).await?;
-        let recv_t: Arc<dyn Transport> = if down == up {
-            send_t.clone()
-        } else {
-            transport::build(down, &cfg, role).await?
-        };
-        info!(
-            uplink = up.as_str(),
-            downlink = down.as_str(),
-            "transports ready"
-        );
-
-        // --- TUN ----------------------------------------------------------
+        // TUN persists across reconnects (keys change, the device does not).
         let tun = Arc::new(TunDevice::create(&cfg.tun).await?);
         info!(dev = tun.name(), mtu = tun.mtu(), "tun device up");
 
-        // --- Active-probe decoy (server) ----------------------------------
+        // Active-probe decoy (server).
         if role == Role::Server && cfg.obfs.decoy_enabled {
             let listen = obfs::decoy::listen_addr(&cfg.obfs.decoy_listen, cfg.spoof.real_ip);
             let target = cfg.obfs.decoy_target.clone();
@@ -119,42 +164,193 @@ impl Engine {
             });
         }
 
-        // --- Handshake ----------------------------------------------------
-        let hs_params = crypto::handshake_params(&cfg)?;
-        let session = match role {
-            Role::Client => client_handshake(&*send_t, &*recv_t, hs_params).await?,
-            Role::Server => server_handshake(&*send_t, &*recv_t, hs_params).await?,
-        };
-        info!(
-            session = format_args!("{:#018x}", session.session_id),
-            pq = session.pq_active,
-            aead = ?session.aead,
-            "session established"
-        );
-        log_overhead(&cfg, up);
+        // Reconnect loop vs. shutdown. On shutdown the reconnect-loop future is
+        // dropped; any in-flight session's AbortGuard then cleans up its tasks.
+        tokio::select! {
+            r = reconnect_loop(cfg.clone(), tun.clone()) => r,
+            _ = wait_for_shutdown() => {
+                info!("shutdown signal received; draining tunnel");
+                Ok(())
+            }
+        }
+    }
+}
 
-        let session = Arc::new(session);
-        let plane = PlaneParams::from_config(&cfg, up);
+/// Candidate transport pairs to try, in order: the configured uplink/downlink
+/// first, then each `failover_order` protocol (used for both directions).
+fn candidate_transports(cfg: &Config) -> Vec<(TransportKind, TransportKind)> {
+    let mut out = vec![(
+        cfg.transport.uplink_protocol,
+        cfg.transport.downlink_protocol,
+    )];
+    for k in &cfg.transport.failover_order {
+        let pair = (*k, *k);
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out
+}
 
-        // --- Data plane ---------------------------------------------------
-        let up_task = tokio::spawn(tun_to_net(
-            tun.clone(),
-            send_t.clone(),
-            session.clone(),
-            plane,
-        ));
-        let down_task = tokio::spawn(net_to_tun(
-            tun.clone(),
-            recv_t.clone(),
-            session.clone(),
-            plane,
-        ));
+/// Reconnect/failover loop. Returns only when auto-reconnect is off and an
+/// attempt fails, or a session ends with auto-reconnect off.
+async fn reconnect_loop(cfg: Arc<Config>, tun: Arc<TunDevice>) -> Result<()> {
+    let candidates = candidate_transports(&cfg);
+    let mut backoff = Backoff::new(
+        cfg.reliability.reconnect_backoff_min_ms,
+        cfg.reliability.reconnect_backoff_max_ms,
+    );
+    let mut idx = 0usize;
 
-        wait_for_shutdown().await;
-        info!("shutting down; draining tunnel");
-        up_task.abort();
-        down_task.abort();
-        Ok(())
+    loop {
+        let (up, down) = candidates[idx % candidates.len()];
+        if cfg.transport.transport_racing && candidates.len() > 1 {
+            info!(transport = up.as_str(), "racing/trying transport");
+        }
+        match connect_and_run(&cfg, tun.clone(), up, down).await {
+            Ok(SessionOutcome::Shutdown) => return Ok(()),
+            Ok(SessionOutcome::Reconnect) => {
+                backoff.reset();
+                if !cfg.reliability.auto_reconnect {
+                    return Ok(());
+                }
+                info!("session ended; reconnecting");
+            }
+            Err(e) => {
+                warn!(err = %e, transport = up.as_str(), "session attempt failed");
+                if !cfg.reliability.auto_reconnect {
+                    return Err(e);
+                }
+                idx += 1; // failover to the next candidate
+            }
+        }
+        let d = backoff.next_delay();
+        debug!(delay_ms = d.as_millis() as u64, "reconnect backoff");
+        tokio::time::sleep(d).await;
+    }
+}
+
+/// How a session finished.
+enum SessionOutcome {
+    Reconnect,
+    Shutdown,
+}
+
+/// Build transports for `(up, down)`, perform the handshake (with a racing
+/// timeout when enabled), and run the data plane until it ends.
+async fn connect_and_run(
+    cfg: &Arc<Config>,
+    tun: Arc<TunDevice>,
+    up: TransportKind,
+    down: TransportKind,
+) -> Result<SessionOutcome> {
+    let role = cfg.role;
+    let send_t = transport::build(up, cfg, role).await?;
+    let recv_t: Arc<dyn Transport> = if down == up {
+        send_t.clone()
+    } else {
+        transport::build(down, cfg, role).await?
+    };
+    info!(
+        uplink = up.as_str(),
+        downlink = down.as_str(),
+        "transports ready"
+    );
+
+    let hs_params = crypto::handshake_params(cfg)?;
+    // Racing: cap the client handshake so a blocked transport fails over fast.
+    let session = match role {
+        Role::Client => {
+            let fut = client_handshake(&*send_t, &*recv_t, hs_params);
+            if cfg.transport.transport_racing {
+                match tokio::time::timeout(Duration::from_secs(6), fut).await {
+                    Ok(r) => r?,
+                    Err(_) => return Err(Error::Session("transport race timed out".into())),
+                }
+            } else {
+                fut.await?
+            }
+        }
+        Role::Server => server_handshake(&*send_t, &*recv_t, hs_params).await?,
+    };
+    info!(
+        session = format_args!("{:#018x}", session.session_id),
+        pq = session.pq_active,
+        aead = ?session.aead,
+        "session established"
+    );
+    log_overhead(cfg, up);
+
+    Ok(run_session(cfg.clone(), tun, send_t, recv_t, Arc::new(session), up).await)
+}
+
+/// Spawn the data-plane tasks + keepalive + hopping, and supervise until the
+/// session ends (dead peer / fatal error) or shutdown.
+async fn run_session(
+    cfg: Arc<Config>,
+    tun: Arc<TunDevice>,
+    send_t: Arc<dyn Transport>,
+    recv_t: Arc<dyn Transport>,
+    session: Arc<SessionCrypto>,
+    up: TransportKind,
+) -> SessionOutcome {
+    let plane = PlaneParams::from_config(&cfg, up);
+    let life = Life::new();
+
+    let mut handles = Vec::new();
+    handles.push(tokio::spawn(tun_to_net(
+        tun.clone(),
+        send_t.clone(),
+        session.clone(),
+        plane,
+        life.clone(),
+    )));
+    handles.push(tokio::spawn(net_to_tun(
+        tun.clone(),
+        recv_t.clone(),
+        send_t.clone(),
+        session.clone(),
+        plane,
+        life.clone(),
+    )));
+
+    // Endpoint hopping (client only): rotate among server endpoints on a
+    // wall-clock schedule both sides compute identically.
+    if cfg.role == Role::Client
+        && cfg.transport.endpoint_hop_interval_secs > 0
+        && cfg.transport.server_endpoints.len() > 1
+        && send_t.supports_hop()
+    {
+        let endpoints = cfg.transport.server_endpoints.clone();
+        let interval = cfg.transport.endpoint_hop_interval_secs;
+        let st = send_t.clone();
+        handles.push(tokio::spawn(async move {
+            hop_loop(st, endpoints, interval).await;
+        }));
+    }
+
+    let _guard = AbortGuard(handles);
+
+    tokio::select! {
+        _ = life.ended.notified() => SessionOutcome::Reconnect,
+        _ = wait_for_shutdown() => SessionOutcome::Shutdown,
+    }
+}
+
+/// Rotate the send transport's endpoint on a time-synchronized schedule.
+async fn hop_loop(
+    send_t: Arc<dyn Transport>,
+    endpoints: Vec<std::net::SocketAddrV4>,
+    interval_secs: u64,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+    loop {
+        ticker.tick().await;
+        // Index derived from wall-clock so both ends pick the same endpoint.
+        let slot = (unix_millis() / 1000 / interval_secs.max(1)) as usize % endpoints.len();
+        let ep = endpoints[slot];
+        send_t.set_peer(ep);
+        debug!(endpoint = %ep, "endpoint hop");
     }
 }
 
@@ -364,11 +560,13 @@ async fn tun_to_net(
     send_t: Arc<dyn Transport>,
     session: Arc<SessionCrypto>,
     plane: PlaneParams,
+    life: Life,
 ) {
     let mut tx_counter: u64 = 0;
     let mut inbuf = vec![0u8; plane.mtu + 256];
     let overhead = HEADER_LEN + crypto::TAG_LEN;
     let jitter_ms = plane.obfs.timing_jitter_ms;
+    let mut last_tx = unix_millis();
 
     let mut fec = if plane.fec_enabled {
         match FecEncoder::new(
@@ -401,11 +599,19 @@ async fn tun_to_net(
     };
     let mut cover_ticker = tokio::time::interval(cover_interval);
 
+    let ka_poll = if plane.keepalive_secs > 0 {
+        (plane.keepalive_secs / 2).max(1)
+    } else {
+        5
+    };
+    let mut ka_ticker = tokio::time::interval(Duration::from_secs(ka_poll));
+
     loop {
         tokio::select! {
             r = tun.recv(&mut inbuf) => {
                 let n = match r { Ok(n) => n, Err(e) => { warn!(err=%e, "tun read error"); continue; } };
                 if n == 0 { continue; }
+                last_tx = unix_millis();
                 if let Some(a) = &mut acc {
                     if a.would_overflow(n) {
                         flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane).await;
@@ -437,6 +643,26 @@ async fn tun_to_net(
                 let pad = plane.obfs.frame_pad(overhead);
                 if let Ok(frame) = seal_chaff(&session, counter, &pad) {
                     emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms).await;
+                    last_tx = unix_millis();
+                }
+            }
+            _ = ka_ticker.tick() => {
+                let now = unix_millis();
+                // Dead-peer detection → end the session (triggers reconnect).
+                if plane.dead_secs > 0 && now.saturating_sub(life.last_rx_ms()) >= plane.dead_secs * 1000 {
+                    warn!("dead peer detected (no traffic); ending session");
+                    life.end();
+                    return;
+                }
+                // Heartbeat when idle (also keeps NAT mappings warm).
+                if plane.keepalive_secs > 0 && now.saturating_sub(last_tx) >= plane.keepalive_secs * 1000 {
+                    let counter = tx_counter;
+                    tx_counter += 1;
+                    let pad = plane.obfs.frame_pad(overhead);
+                    if let Ok(frame) = seal_typed(&session, FrameType::Keepalive, counter, 0, &[], &pad) {
+                        emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms).await;
+                        last_tx = now;
+                    }
                 }
             }
         }
@@ -462,33 +688,41 @@ async fn flush_batch(
     }
 }
 
-/// `net → tun`: FEC reconstruct (optional), decrypt, debatch (if mux), deliver.
+/// `net → tun`: FEC reconstruct (optional), decrypt, debatch (if mux), deliver,
+/// plus liveness tracking and auth-gated connection migration.
 async fn net_to_tun(
     tun: Arc<TunDevice>,
     recv_t: Arc<dyn Transport>,
+    send_t: Arc<dyn Transport>,
     session: Arc<SessionCrypto>,
     plane: PlaneParams,
+    life: Life,
 ) {
     use crate::crypto::ReplayWindow;
-    let mut replay = ReplayWindow::new(2048);
+    let mut replay = ReplayWindow::new(plane.replay_window);
     let mut dec = if plane.fec_enabled {
         Some(FecDecoder::new(plane.fec_mode, plane.fec_max_groups))
     } else {
         None
     };
     let mut buf = vec![0u8; RECV_CAP];
+    let mut cur_peer: Option<std::net::Ipv4Addr> = None;
 
     loop {
-        let n = match recv_t.recv_frame(&mut buf).await {
-            Ok(n) => n,
+        let (n, src) = match recv_t.recv_frame_from(&mut buf).await {
+            Ok(x) => x,
             Err(e) => {
-                warn!(err = %e, "transport recv error");
-                continue;
+                // A fatal transport error (e.g. QUIC connection closed) ends
+                // the session so the manager can reconnect.
+                warn!(err = %e, "transport recv error; ending session");
+                life.end();
+                return;
             }
         };
         if n == 0 {
             continue;
         }
+        life.mark_rx();
 
         // FEC stage (if enabled) yields 0+ sealed frames; otherwise the
         // datagram is the sealed frame.
@@ -501,42 +735,57 @@ async fn net_to_tun(
             vec![buf[..n].to_vec()]
         };
 
+        let mut authed = false;
         for frame in sealed_frames {
-            process_sealed(&tun, &session, &mut replay, &frame).await;
+            authed |= process_sealed(&tun, &session, &mut replay, &frame).await;
+        }
+
+        // Connection migration: once an authenticated frame arrives from a new
+        // source, adopt it as the peer (server side). Never trust the source
+        // before authentication.
+        if authed && plane.migration && plane.is_server && send_t.supports_hop() {
+            if let Some(ip) = src {
+                if cur_peer != Some(ip) {
+                    send_t.set_peer(std::net::SocketAddrV4::new(ip, plane.data_port));
+                    cur_peer = Some(ip);
+                    info!(peer = %ip, "connection migrated to new peer source");
+                }
+            }
         }
     }
 }
 
-/// Decode, anti-replay, decrypt, and deliver one sealed frame.
+/// Decode, anti-replay, decrypt, and deliver one sealed frame. Returns `true`
+/// if an authenticated `Data` frame was processed (used to gate migration).
 async fn process_sealed(
     tun: &TunDevice,
     session: &SessionCrypto,
     replay: &mut crate::crypto::ReplayWindow,
     frame: &[u8],
-) {
+) -> bool {
     if frame.len() < HEADER_LEN {
-        return;
+        return false;
     }
     let (header, _) = match Header::decode(frame) {
         Ok(x) => x,
-        Err(_) => return, // malformed — drop silently
+        Err(_) => return false, // malformed — drop silently
     };
     match header.ftype {
         FrameType::Data => {
             if !replay.check_and_update(header.counter) {
                 debug!(counter = header.counter, "replay/stale frame dropped");
-                return;
+                return false;
             }
             let aad = &frame[..HEADER_LEN];
             let mut body = frame[HEADER_LEN..].to_vec();
             if session.rx.open(header.counter, aad, &mut body).is_err() {
-                return; // fail-closed
+                return false; // fail-closed
             }
             // Strip padding if present, then (if batched) split.
             let payload: &[u8] = if header.flags & flags::PADDED != 0 {
                 match obfs::padding::strip(&body) {
                     Some(p) => p,
-                    None => return, // malformed padding trailer — drop
+                    None => return false, // malformed padding trailer — drop
                 }
             } else {
                 &body
@@ -550,10 +799,16 @@ async fn process_sealed(
             } else {
                 let _ = tun.send(payload).await;
             }
+            true
         }
-        FrameType::Keepalive => debug!("keepalive received"),
+        FrameType::Keepalive => {
+            // Liveness only (the arrival already refreshed last_rx in the
+            // caller). Migration conservatively requires a decrypted Data frame.
+            debug!("keepalive received");
+            false
+        }
         // Chaff/cover frames decrypt to nothing meaningful — drop silently.
-        _ => {}
+        _ => false,
     }
 }
 

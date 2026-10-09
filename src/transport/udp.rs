@@ -8,6 +8,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
 
@@ -24,7 +25,7 @@ pub struct UdpTransport {
     raw: RawIpSocket,
     recv_sock: UdpSocket,
     src: Ipv4Addr,
-    dst: Ipv4Addr,
+    dst: ArcSwap<Ipv4Addr>,
     src_port: u16,
     dst_port: u16,
     ttl_pool: Vec<u8>,
@@ -47,7 +48,7 @@ impl UdpTransport {
             raw,
             recv_sock,
             src: p.forged_src,
-            dst: p.peer_real,
+            dst: ArcSwap::from_pointee(p.peer_real),
             src_port: p.data_port,
             dst_port: p.data_port,
             ttl_pool: p.ttl_pool.clone(),
@@ -68,6 +69,7 @@ impl Transport for UdpTransport {
         if udp_len > u16::MAX as usize {
             return Err(Error::transport("udp", "frame too large for one datagram"));
         }
+        let dst = **self.dst.load();
         let mut seg = Vec::with_capacity(udp_len);
         seg.extend_from_slice(&self.src_port.to_be_bytes());
         seg.extend_from_slice(&self.dst_port.to_be_bytes());
@@ -75,21 +77,21 @@ impl Transport for UdpTransport {
         seg.extend_from_slice(&0u16.to_be_bytes()); // checksum placeholder
         seg.extend_from_slice(frame);
 
-        let csum = udp_checksum(self.src, self.dst, &seg);
+        let csum = udp_checksum(self.src, dst, &seg);
         // A computed 0 is transmitted as 0xFFFF (0 means "no checksum" in IPv4 UDP).
         let csum = if csum == 0 { 0xFFFF } else { csum };
         seg[6..8].copy_from_slice(&csum.to_be_bytes());
 
         let pkt = ipv4::build(&Ipv4Build {
             src: self.src,
-            dst: self.dst,
+            dst,
             protocol: 17,
             ttl: super::pick(&self.ttl_pool, 64),
             tos: super::pick(&self.dscp_pool, 0),
             id: self.ip_id.next(),
             payload: &seg,
         });
-        self.raw.send_to(&pkt, self.dst).await?;
+        self.raw.send_to(&pkt, dst).await?;
         Ok(())
     }
 
@@ -100,6 +102,27 @@ impl Transport for UdpTransport {
             .await
             .map_err(|e| Error::transport("udp", format!("recv: {e}")))?;
         Ok(n)
+    }
+
+    async fn recv_frame_from(&self, buf: &mut [u8]) -> Result<(usize, Option<Ipv4Addr>)> {
+        let (n, src) = self
+            .recv_sock
+            .recv_from(buf)
+            .await
+            .map_err(|e| Error::transport("udp", format!("recv: {e}")))?;
+        let ip = match src {
+            SocketAddr::V4(v4) => Some(*v4.ip()),
+            SocketAddr::V6(_) => None,
+        };
+        Ok((n, ip))
+    }
+
+    fn set_peer(&self, dst: SocketAddrV4) {
+        self.dst.store(std::sync::Arc::new(*dst.ip()));
+    }
+
+    fn supports_hop(&self) -> bool {
+        true
     }
 }
 

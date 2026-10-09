@@ -6,6 +6,8 @@
 
 use std::net::Ipv4Addr;
 
+use arc_swap::ArcSwap;
+
 use crate::error::Result;
 use crate::spoof::ipv4::{self, Ipv4Build};
 use crate::spoof::{IpIdCounter, RawIpSocket};
@@ -16,7 +18,8 @@ use super::TransportParams;
 pub struct RawCore {
     raw: RawIpSocket,
     src: Ipv4Addr,
-    dst: Ipv4Addr,
+    /// Dynamic destination (hopping/migration) — one atomic load per packet.
+    dst: ArcSwap<Ipv4Addr>,
     expect_src: Ipv4Addr,
     accept_any: bool,
     ttl_pool: Vec<u8>,
@@ -32,7 +35,7 @@ impl RawCore {
         Ok(RawCore {
             raw,
             src: p.forged_src,
-            dst: p.peer_real,
+            dst: ArcSwap::from_pointee(p.peer_real),
             expect_src: p.peer_spoofed,
             accept_any: p.accept_any_src,
             ttl_pool: p.ttl_pool.clone(),
@@ -42,19 +45,25 @@ impl RawCore {
         })
     }
 
+    /// Update the destination address (endpoint hopping / migration).
+    pub fn set_dst(&self, dst: Ipv4Addr) {
+        self.dst.store(std::sync::Arc::new(dst));
+    }
+
     /// Build the IPv4 packet around an already-formed L4 payload and send it,
     /// applying per-packet TTL jitter and DSCP marking.
     pub async fn send_l4(&self, l4: &[u8]) -> Result<()> {
+        let dst = **self.dst.load();
         let pkt = ipv4::build(&Ipv4Build {
             src: self.src,
-            dst: self.dst,
+            dst,
             protocol: self.protocol,
             ttl: super::pick(&self.ttl_pool, 64),
             tos: super::pick(&self.dscp_pool, 0),
             id: self.ip_id.next(),
             payload: l4,
         });
-        self.raw.send_to(&pkt, self.dst).await?;
+        self.raw.send_to(&pkt, dst).await?;
         Ok(())
     }
 

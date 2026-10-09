@@ -58,8 +58,7 @@ enum Cmd {
     Genkey,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -76,7 +75,7 @@ async fn main() -> Result<()> {
             let cfg =
                 freespoof::app::load_config(&cli.config, cli.role.map(Into::into), cli.log_level)
                     .context("loading configuration")?;
-            freespoof::app::run(cfg).await.map_err(anyhow::Error::from)
+            freespoof::app::bootstrap(cfg).map_err(anyhow::Error::from)
         }
     }
 }

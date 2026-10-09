@@ -10,6 +10,7 @@
 //! (`net.ipv4.icmp_echo_ignore_all=1`, applied by the setup step), otherwise
 //! it would race our userspace replies.
 
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use async_trait::async_trait;
@@ -78,9 +79,30 @@ impl Transport for IcmpTransport {
     }
 
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize> {
+        let (m, _src) = self.recv_inner(buf).await?;
+        Ok(m)
+    }
+
+    async fn recv_frame_from(&self, buf: &mut [u8]) -> Result<(usize, Option<Ipv4Addr>)> {
+        let (m, src) = self.recv_inner(buf).await?;
+        Ok((m, Some(src)))
+    }
+
+    fn set_peer(&self, dst: SocketAddrV4) {
+        self.core.set_dst(*dst.ip());
+    }
+
+    fn supports_hop(&self) -> bool {
+        true
+    }
+}
+
+impl IcmpTransport {
+    /// Receive one ICMP Echo datagram and strip the 8-byte header.
+    async fn recv_inner(&self, buf: &mut [u8]) -> Result<(usize, Ipv4Addr)> {
         let mut tmp = vec![0u8; buf.len() + ICMP_HEADER];
         loop {
-            let (n, _src) = self.core.recv_l4(&mut tmp).await?;
+            let (n, src) = self.core.recv_l4(&mut tmp).await?;
             if n < ICMP_HEADER {
                 continue; // not a full ICMP echo — skip
             }
@@ -92,7 +114,7 @@ impl Transport for IcmpTransport {
             let payload = &tmp[ICMP_HEADER..n];
             let m = payload.len().min(buf.len());
             buf[..m].copy_from_slice(&payload[..m]);
-            return Ok(m);
+            return Ok((m, src));
         }
     }
 }

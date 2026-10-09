@@ -113,6 +113,22 @@ pub trait Transport: Send + Sync {
 
     /// Receive one wire frame from the peer into `buf`, returning its length.
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize>;
+
+    /// Receive one frame, also reporting the observed source address (for
+    /// auth-gated connection migration). Defaults to no source.
+    async fn recv_frame_from(&self, buf: &mut [u8]) -> Result<(usize, Option<std::net::Ipv4Addr>)> {
+        let n = self.recv_frame(buf).await?;
+        Ok((n, None))
+    }
+
+    /// Change the peer destination live (endpoint/port hopping, migration).
+    /// Raw and UDP transports support this; connection-bound ones (QUIC) don't.
+    fn set_peer(&self, _dst: std::net::SocketAddrV4) {}
+
+    /// Whether this transport can change its peer endpoint without a reconnect.
+    fn supports_hop(&self) -> bool {
+        false
+    }
 }
 
 /// Build a transport of `kind` for this side.

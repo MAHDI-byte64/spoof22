@@ -40,10 +40,12 @@ pub mod fec;
 pub mod log;
 pub mod mux;
 pub mod obfs;
+pub mod reliability;
 pub mod session;
 pub mod spoof;
 pub mod transport;
 pub mod tun;
+pub mod tune;
 pub mod wire;
 
 pub use error::{Error, Result};

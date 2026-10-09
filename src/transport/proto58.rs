@@ -5,6 +5,8 @@
 //! neighbor-discovery / ICMPv6 encapsulation, which many middleboxes pass
 //! without deep inspection.
 
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 use async_trait::async_trait;
 
 use crate::config::TransportKind;
@@ -40,5 +42,18 @@ impl Transport for Proto58Transport {
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize> {
         let (n, _src) = self.core.recv_l4(buf).await?;
         Ok(n)
+    }
+
+    async fn recv_frame_from(&self, buf: &mut [u8]) -> Result<(usize, Option<Ipv4Addr>)> {
+        let (n, src) = self.core.recv_l4(buf).await?;
+        Ok((n, Some(src)))
+    }
+
+    fn set_peer(&self, dst: SocketAddrV4) {
+        self.core.set_dst(*dst.ip());
+    }
+
+    fn supports_hop(&self) -> bool {
+        true
     }
 }

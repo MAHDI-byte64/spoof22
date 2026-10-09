@@ -26,10 +26,9 @@ struct Cli {
     log_level: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = freespoof::app::load_config(&cli.config, Some(Role::Client), cli.log_level)
         .context("loading client configuration")?;
-    freespoof::app::run(cfg).await.map_err(anyhow::Error::from)
+    freespoof::app::bootstrap(cfg).map_err(anyhow::Error::from)
 }

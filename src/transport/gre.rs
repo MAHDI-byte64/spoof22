@@ -5,6 +5,8 @@
 //! inner protocol as transparent Ethernet bridging (0x6558), a common value
 //! for GRE tunnels, which keeps the framing plausible to a DPI engine.
 
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 use async_trait::async_trait;
 
 use crate::config::TransportKind;
@@ -47,15 +49,35 @@ impl Transport for GreTransport {
     }
 
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize> {
-        // Receive into a temporary that includes the GRE header, then strip it.
+        let (m, _src) = self.recv_inner(buf).await?;
+        Ok(m)
+    }
+
+    async fn recv_frame_from(&self, buf: &mut [u8]) -> Result<(usize, Option<Ipv4Addr>)> {
+        let (m, src) = self.recv_inner(buf).await?;
+        Ok((m, Some(src)))
+    }
+
+    fn set_peer(&self, dst: SocketAddrV4) {
+        self.core.set_dst(*dst.ip());
+    }
+
+    fn supports_hop(&self) -> bool {
+        true
+    }
+}
+
+impl GreTransport {
+    /// Receive one GRE datagram and strip the 4-byte header.
+    async fn recv_inner(&self, buf: &mut [u8]) -> Result<(usize, Ipv4Addr)> {
         let mut tmp = vec![0u8; buf.len() + GRE_HEADER];
-        let (n, _src) = self.core.recv_l4(&mut tmp).await?;
+        let (n, src) = self.core.recv_l4(&mut tmp).await?;
         if n < GRE_HEADER {
             return Err(Error::decode("gre: frame shorter than GRE header"));
         }
         let payload = &tmp[GRE_HEADER..n];
         let m = payload.len().min(buf.len());
         buf[..m].copy_from_slice(&payload[..m]);
-        Ok(m)
+        Ok((m, src))
     }
 }
