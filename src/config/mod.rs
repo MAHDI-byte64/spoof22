@@ -615,8 +615,14 @@ pub struct HardeningConfig {
     pub run_as_user: String,
     /// Drop to this group after setup (empty = derive from user).
     pub run_as_group: String,
-    /// Apply a seccomp/Landlock sandbox after init (best effort).
+    /// Apply the Landlock filesystem sandbox after init (best effort; a kernel
+    /// without Landlock is logged and skipped, never fatal).
     pub sandbox: bool,
+    /// Install the seccomp-bpf syscall deny-list after privilege drop (best
+    /// effort). Blocks dangerous syscalls (ptrace, module loading, mount,
+    /// kexec, bpf, keyrings, …) with EPERM — it never kills the process, and a
+    /// kernel without seccomp is logged and skipped.
+    pub seccomp: bool,
 }
 
 // ---------------------------------------------------------------------------

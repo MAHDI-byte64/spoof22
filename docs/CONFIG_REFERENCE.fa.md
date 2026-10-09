@@ -214,7 +214,8 @@
 |------|-----|---------|-------|
 | `run_as_user` | string | `""` (خالی = بدون افت) | پس از گرفتن caps/سوکت‌ها/فایروال، به این کاربر افت امتیاز شود (خالی = بدون افت). |
 | `run_as_group` | string | `""` (خالی) | پس از راه‌اندازی به این گروه افت شود (خالی = از کاربر مشتق می‌شود). |
-| `sandbox` | boolean | `false` | اعمال sandbox نوع seccomp/Landlock پس از init (best effort). |
+| `sandbox` | boolean | `false` | اعمال sandbox سیستم‌فایل با **Landlock** پس از init: دسترسی خواندنی به مسیرهای سیستمیِ لازم و نوشتنی فقط به `/run`، `/var`، `/tmp`. best-effort؛ هسته‌ی فاقد Landlock فقط log و رد می‌شود. |
+| `seccomp` | boolean | `false` | نصب **deny-list** فراخوان‌های سیستمی با seccomp-bpf پس از افت امتیاز: فراخوان‌های خطرناک (ptrace، بارگذاری ماژول، mount، kexec، bpf، keyring، `process_vm_*`، userfaultfd و …) با `EPERM` رد می‌شوند. هرگز پروسه را نمی‌کشد؛ best-effort. |
 
 ---
 

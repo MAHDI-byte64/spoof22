@@ -12,10 +12,24 @@
 //! the process keeps its current privileges rather than ending up unable to
 //! work (a warning is logged); it never silently half-drops.
 //!
-//! seccomp / Landlock sandboxing after init is a documented extension point
-//! ([`apply_sandbox`]); it is intentionally a clear no-op-with-note rather than
-//! a broken partial filter that might kill the process on an unlisted syscall.
+//! Two post-init sandboxes harden the running process (both best-effort — a
+//! kernel that lacks the feature is logged and skipped, never fatal):
+//!
+//! * [`landlock_sandbox`] restricts filesystem access via the Landlock LSM:
+//!   read-only on the system paths the process still needs (binaries + shared
+//!   libraries for the `nft`/`iptables` teardown, `/etc`, `/proc`, `/sys`,
+//!   `/dev` for `/dev/urandom` + the already-open TUN) and read-write only on
+//!   the runtime dirs (`/run`, `/var`, `/tmp`). After this the process cannot
+//!   read `/home`, write `/etc`, or touch anything outside those trees.
+//! * [`seccomp_filter`] installs a seccomp-bpf **deny-list**: the normal
+//!   runtime syscalls stay allowed (default action = Allow), while a curated
+//!   set of dangerous syscalls (ptrace, kernel-module loading, `mount`,
+//!   `kexec`, `bpf`, keyrings, `process_vm_*`, `userfaultfd`, …) is answered
+//!   with `EPERM`. A deny-list never kills the process on an unlisted syscall,
+//!   so it is safe to ship, unlike a brittle allow-list that must enumerate
+//!   every syscall tokio/rustls/mimalloc might emit.
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 
 use tracing::{info, warn};
@@ -113,17 +127,145 @@ pub fn drop_privileges(user: &str, group: &str) -> Result<()> {
     Ok(())
 }
 
-/// Apply a seccomp/Landlock sandbox after init.
-///
-/// Extension point: a correct allow-list must enumerate every syscall the
-/// runtime, TLS stack and tokio reactor use, or it will kill the process at
-/// random. Rather than ship a partial filter that breaks under load, this is a
-/// no-op that logs its status; wire a vetted profile (e.g. the `seccompiler`
-/// or `landlock` crate) here when a tested allow-list exists.
-pub fn apply_sandbox(enabled: bool) {
-    if enabled {
-        warn!("sandbox requested: seccomp/Landlock is a documented extension point (not applied)");
+/// Apply the Landlock filesystem sandbox (best effort). Call this after all
+/// files/sockets the process needs have been opened and before the main loop.
+/// A kernel without Landlock support (or a partial ABI) degrades gracefully:
+/// the status is logged and the process continues unrestricted.
+pub fn landlock_sandbox(enabled: bool) {
+    if !enabled {
+        return;
     }
+    match install_landlock() {
+        Ok(status) => {
+            use landlock::RulesetStatus::*;
+            match status.ruleset {
+                FullyEnforced => info!("landlock filesystem sandbox fully enforced"),
+                PartiallyEnforced => {
+                    info!("landlock filesystem sandbox partially enforced (older ABI)")
+                }
+                NotEnforced => {
+                    warn!("landlock not enforced (kernel lacks Landlock); continuing")
+                }
+            }
+        }
+        Err(e) => warn!(err = %e, "landlock sandbox not applied; continuing"),
+    }
+}
+
+/// Install the seccomp-bpf syscall deny-list (best effort). Call this *after*
+/// [`drop_privileges`] so the identity/capability syscalls are not filtered.
+/// On a kernel without seccomp the error is logged and the process continues.
+pub fn seccomp_filter(enabled: bool) {
+    if !enabled {
+        return;
+    }
+    match install_seccomp() {
+        Ok(n) => info!(denied = n, "seccomp syscall deny-list installed (EPERM)"),
+        Err(e) => warn!(err = %e, "seccomp filter not applied; continuing"),
+    }
+}
+
+/// Read-only Landlock paths: the binaries + shared libraries needed to execve
+/// `nft`/`iptables` at teardown, plus config/runtime-info trees.
+const LANDLOCK_RO: &[&str] = &[
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev",
+];
+/// Read-write Landlock paths: runtime dirs (control socket, xtables lock, tmp).
+const LANDLOCK_RW: &[&str] = &["/run", "/var", "/tmp"];
+
+fn install_landlock() -> std::result::Result<landlock::RestrictionStatus, landlock::RulesetError> {
+    use landlock::{
+        Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, ABI,
+    };
+
+    // ABI::V1 is the lowest common denominator; BestEffort downgrades the rule
+    // set on newer-only access rights and no-ops entirely on an unaware kernel.
+    let abi = ABI::V1;
+    let ro = AccessFs::from_read(abi);
+    let rw = AccessFs::from_all(abi);
+
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_all(abi))?
+        .create()?;
+
+    for p in LANDLOCK_RO {
+        // A path that does not exist on this host is simply skipped.
+        if let Ok(fd) = PathFd::new(p) {
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, ro))?;
+        }
+    }
+    for p in LANDLOCK_RW {
+        if let Ok(fd) = PathFd::new(p) {
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, rw))?;
+        }
+    }
+    ruleset.restrict_self()
+}
+
+/// Target architecture for the seccomp filter (compile-time).
+#[cfg(target_arch = "x86_64")]
+const SECCOMP_ARCH: seccompiler::TargetArch = seccompiler::TargetArch::x86_64;
+#[cfg(target_arch = "aarch64")]
+const SECCOMP_ARCH: seccompiler::TargetArch = seccompiler::TargetArch::aarch64;
+
+/// Build and apply the deny-list. Returns the number of denied syscalls.
+///
+/// Every listed syscall is answered with `EPERM`; everything else (the whole
+/// tokio/rustls/socket/TUN working set, plus the setuid/capset path and the
+/// `fork`/`execve` the firewall teardown needs) keeps the default `Allow`.
+fn install_seccomp() -> std::result::Result<usize, Box<dyn std::error::Error>> {
+    use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter};
+
+    // Syscalls an authorized tunnel should never make. All exist on both
+    // x86_64 and aarch64 in libc 0.2, so the cross builds compile unchanged.
+    let denied: &[libc::c_long] = &[
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_kexec_load,
+        libc::SYS_kexec_file_load,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_setns,
+        libc::SYS_unshare,
+        libc::SYS_reboot,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+        libc::SYS_add_key,
+        libc::SYS_keyctl,
+        libc::SYS_request_key,
+        libc::SYS_perf_event_open,
+        libc::SYS_bpf,
+        libc::SYS_acct,
+        libc::SYS_userfaultfd,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_name_to_handle_at,
+    ];
+
+    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
+    for &sc in denied {
+        // `libc::c_long` is `i64` on every 64-bit target we build for.
+        // An empty rule vector = unconditional match → the match action.
+        rules.insert(sc, vec![]);
+    }
+    let count = rules.len();
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,                        // default: allow unlisted
+        SeccompAction::Errno(libc::EPERM as u32),    // listed: deny with EPERM
+        SECCOMP_ARCH,
+    )?;
+    let prog: BpfProgram = filter.try_into()?;
+    apply_filter(&prog)?;
+    Ok(count)
 }
 
 unsafe fn lookup_uid(user: &str) -> Result<libc::uid_t> {

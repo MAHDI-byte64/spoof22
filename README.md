@@ -469,10 +469,14 @@ self-signedِ موقت (ephemeral) هم تولید می‌کند.
   فرستنده) یک نقطه‌ی توسعه‌ی مستند است. `quic` کنترل‌کننده‌ی خودش را دارد و مستقل است.
 - **I/Oِ پرشتاب:** `io_uring`، آگاهیِ NUMA، و `GSO`/`sendmmsg` به‌عنوانِ بهینه‌سازی‌های آینده
   (best-effort) در نظر گرفته شده‌اند؛ فعلاً مسیرِ امنِ tokio/socket2 به‌کار می‌رود.
-- **اثرانگشتِ TLSِ بایت‌دقیق (JA3):** پروفایل‌های `tls_fingerprint` شکلِ کلی را تقلید می‌کنند؛
-  بازتولیدِ بایت‌به‌بایتِ ClientHello (JA3/uTLSِ دقیق) یک نقطه‌ی توسعه است.
-- **sandbox (seccomp/Landlock):** `hardening.sandbox` یک نقطه‌ی توسعه‌ی صریح است؛ به‌جای یک
-  فیلترِ ناقص که ممکن است فرایند را بکُشد، فعلاً یک no-op با هشدارِ لاگ است.
+- **اثرانگشتِ TLS (JA3):** روی ترانسپورتِ TCPِ خام که هر بایت را خودمان می‌سازیم، یک
+  ClientHelloِ دست‌سازِ مرورگری (Chrome/Firefox، با GREASE، SNI، ALPN، key_share و …)
+  به‌عنوانِ اولین سگمنت ارسال می‌شود تا JA3 به‌جای اثرانگشتِ کتابخانه مثلِ یک مرورگرِ واقعی
+  دیده شود (`obfs.tls_fingerprint` + `obfs.fake_tls_header`). QUIC از rustls استفاده می‌کند و
+  ترتیبِ اکستنشن‌ها در اختیارِ ما نیست.
+- **sandbox (Landlock + seccomp):** `hardening.sandbox` یک sandboxِ سیستم‌فایلِ Landlock اعمال
+  می‌کند و `hardening.seccomp` یک deny-listِ seccomp-bpf (ردِ فراخوان‌های خطرناک با `EPERM`).
+  هر دو best-effort هستند: روی هسته‌ی فاقدِ قابلیت فقط log و رد می‌شوند و هرگز پروسه را نمی‌کشند.
 
 ---
 

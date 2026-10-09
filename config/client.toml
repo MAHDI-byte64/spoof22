@@ -361,5 +361,9 @@ stream_window = 16777216
 run_as_user = ""
 # افت به این گروه (خالی = از روی کاربر استنتاج می‌شود).
 run_as_group = ""
-# اعمال sandbox نوع seccomp/Landlock پس از init (بهترین تلاش).
+# اعمال sandbox سیستم‌فایل با Landlock پس از init (بهترین تلاش). هسته‌ی فاقد
+# Landlock فقط log و رد می‌شود (fatal نیست).
 sandbox = false
+# نصب deny-list فراخوان‌های سیستمی با seccomp-bpf پس از افت امتیاز (بهترین تلاش).
+# فراخوان‌های خطرناک با EPERM رد می‌شوند؛ هرگز پروسه را نمی‌کشد.
+seccomp = false

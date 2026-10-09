@@ -292,13 +292,16 @@ impl Engine {
         };
 
         // Sandbox + privilege drop (retains CAP_NET_RAW/ADMIN for reconnects).
-        crate::hardening::apply_sandbox(cfg.hardening.sandbox);
+        // Order: Landlock (needs the listeners/TUN already open) → drop uid/gid
+        // → seccomp (must not filter the setuid/capset path).
+        crate::hardening::landlock_sandbox(cfg.hardening.sandbox);
         if let Err(e) = crate::hardening::drop_privileges(
             &cfg.hardening.run_as_user,
             &cfg.hardening.run_as_group,
         ) {
             warn!(err = %e, "privilege drop failed; continuing with current privileges");
         }
+        crate::hardening::seccomp_filter(cfg.hardening.seccomp);
 
         // Spawn observability servers on the pre-bound listeners.
         if let Some(l) = metrics_listener {

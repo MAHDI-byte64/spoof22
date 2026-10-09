@@ -415,5 +415,11 @@ run_as_user = ""
 # افت به این گروه پس از راه‌اندازی (خالی = از روی کاربر استنتاج می‌شود).
 run_as_group = ""
 
-# اعمال sandbox نوع seccomp/Landlock پس از init (بهترین تلاش).
+# اعمال sandbox سیستم‌فایل با Landlock پس از init (بهترین تلاش). دسترسی فایل را
+# به مسیرهای لازم محدود می‌کند؛ هسته‌ی فاقد Landlock فقط log و رد می‌شود (fatal نیست).
 sandbox = false
+
+# نصب deny-list فراخوان‌های سیستمی با seccomp-bpf پس از افت امتیاز (بهترین تلاش).
+# فراخوان‌های خطرناک (ptrace، بارگذاری ماژول، mount، kexec، bpf، keyring و …) با
+# EPERM رد می‌شوند؛ هرگز پروسه را نمی‌کشد و هسته‌ی فاقد seccomp فقط log و رد می‌شود.
+seccomp = false

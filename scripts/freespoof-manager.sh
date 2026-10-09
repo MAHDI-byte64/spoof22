@@ -429,6 +429,9 @@ generate_server_config() {
     echo "[hardening]"
     # درون‌ریزیِ privilege در خودِ فرایند لازم نیست؛ systemd با User= و AmbientCapabilities این کار را می‌کند.
     echo "run_as_user = \"\""
+    # sandboxها بهترین‌تلاش‌اند و روی هسته‌ی فاقد قابلیت فقط log و رد می‌شوند.
+    echo "sandbox = true"
+    echo "seccomp = true"
     if [[ "$TRANSPORT" == "quic" ]]; then
       echo ""
       echo "[quic]"
