@@ -35,9 +35,12 @@ pub mod error;
 
 pub mod app;
 pub mod config;
+pub mod control;
 pub mod crypto;
 pub mod fec;
+pub mod hardening;
 pub mod log;
+pub mod metrics;
 pub mod mux;
 pub mod obfs;
 pub mod reliability;

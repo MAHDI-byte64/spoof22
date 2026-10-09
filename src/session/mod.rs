@@ -24,6 +24,7 @@ use crate::config::{Config, FecMode, Role, TransportKind};
 use crate::crypto::{self, SessionCrypto};
 use crate::error::{Error, Result};
 use crate::fec::{FecDecoder, FecEncoder};
+use crate::metrics::{drop_reason, Metrics};
 use crate::mux::{self, BatchAccumulator};
 use crate::obfs::{self, Obfs};
 use crate::reliability::Backoff;
@@ -144,7 +145,9 @@ impl Engine {
     }
 
     /// Run until a shutdown signal (SIGINT/SIGTERM) arrives, reconnecting with
-    /// backoff/failover as needed.
+    /// backoff/failover as needed. Sets up the TUN, firewall/NAT/kill-switch,
+    /// observability endpoints and (optionally) drops privileges before the
+    /// reconnect loop, and tears the firewall down on every exit path.
     pub async fn run(self) -> Result<()> {
         let cfg = Arc::new(self.cfg);
         let role = cfg.role;
@@ -152,6 +155,44 @@ impl Engine {
         // TUN persists across reconnects (keys change, the device does not).
         let tun = Arc::new(TunDevice::create(&cfg.tun).await?);
         info!(dev = tun.name(), mtu = tun.mtu(), "tun device up");
+
+        // Firewall / NAT / kill switch / routing (needs CAP_NET_ADMIN).
+        let mut firewall = crate::tun::Firewall::setup(&cfg).await?;
+
+        // Observability: bind the metrics + control listeners BEFORE dropping
+        // privileges (the control socket may live in a root-owned dir).
+        let control = crate::control::Control::new(crate::metrics::Metrics::new());
+        control.set_status(format!("{:?} starting", role));
+        let metrics_listener = if cfg.observability.metrics_addr.is_empty() {
+            None
+        } else {
+            crate::metrics::server::bind(&cfg.observability.metrics_addr)
+                .await
+                .ok()
+        };
+        let control_listener = if cfg.observability.control_socket.is_empty() {
+            None
+        } else {
+            crate::control::bind(&cfg.observability.control_socket).ok()
+        };
+
+        // Sandbox + privilege drop (retains CAP_NET_RAW/ADMIN for reconnects).
+        crate::hardening::apply_sandbox(cfg.hardening.sandbox);
+        if let Err(e) = crate::hardening::drop_privileges(
+            &cfg.hardening.run_as_user,
+            &cfg.hardening.run_as_group,
+        ) {
+            warn!(err = %e, "privilege drop failed; continuing with current privileges");
+        }
+
+        // Spawn observability servers on the pre-bound listeners.
+        if let Some(l) = metrics_listener {
+            let m = control.metrics().clone();
+            tokio::spawn(crate::metrics::server::serve_listener(l, m));
+        }
+        if let Some(l) = control_listener {
+            tokio::spawn(crate::control::serve_listener(l, control.clone()));
+        }
 
         // Active-probe decoy (server).
         if role == Role::Server && cfg.obfs.decoy_enabled {
@@ -164,16 +205,35 @@ impl Engine {
             });
         }
 
-        // Reconnect loop vs. shutdown. On shutdown the reconnect-loop future is
-        // dropped; any in-flight session's AbortGuard then cleans up its tasks.
-        tokio::select! {
-            r = reconnect_loop(cfg.clone(), tun.clone()) => r,
+        // SIGHUP → signal a config reload (applied on the next session).
+        spawn_sighup(control.clone());
+
+        // Reconnect loop vs. shutdown.
+        let result = tokio::select! {
+            r = reconnect_loop(cfg.clone(), tun.clone(), control.clone()) => r,
             _ = wait_for_shutdown() => {
                 info!("shutdown signal received; draining tunnel");
                 Ok(())
             }
-        }
+        };
+
+        // Always revert firewall/NAT/routing on exit.
+        firewall.teardown().await;
+        result
     }
+}
+
+/// Spawn a task that forwards SIGHUP into a reload request.
+fn spawn_sighup(control: crate::control::Control) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut hup) = signal(SignalKind::hangup()) {
+            while hup.recv().await.is_some() {
+                info!("SIGHUP received; requesting reload");
+                control.signal_reload();
+            }
+        }
+    });
 }
 
 /// Candidate transport pairs to try, in order: the configured uplink/downlink
@@ -194,20 +254,35 @@ fn candidate_transports(cfg: &Config) -> Vec<(TransportKind, TransportKind)> {
 
 /// Reconnect/failover loop. Returns only when auto-reconnect is off and an
 /// attempt fails, or a session ends with auto-reconnect off.
-async fn reconnect_loop(cfg: Arc<Config>, tun: Arc<TunDevice>) -> Result<()> {
+async fn reconnect_loop(
+    cfg: Arc<Config>,
+    tun: Arc<TunDevice>,
+    control: crate::control::Control,
+) -> Result<()> {
     let candidates = candidate_transports(&cfg);
     let mut backoff = Backoff::new(
         cfg.reliability.reconnect_backoff_min_ms,
         cfg.reliability.reconnect_backoff_max_ms,
     );
     let mut idx = 0usize;
+    let mut first = true;
 
     loop {
-        let (up, down) = candidates[idx % candidates.len()];
+        // A live `switch-transport` override takes precedence over the
+        // candidate rotation.
+        let (up, down) = match control.desired_transport() {
+            Some(k) => (k, k),
+            None => candidates[idx % candidates.len()],
+        };
         if cfg.transport.transport_racing && candidates.len() > 1 {
             info!(transport = up.as_str(), "racing/trying transport");
         }
-        match connect_and_run(&cfg, tun.clone(), up, down).await {
+        if !first {
+            control.metrics().inc_reconnects();
+        }
+        first = false;
+
+        match connect_and_run(&cfg, tun.clone(), up, down, &control).await {
             Ok(SessionOutcome::Shutdown) => return Ok(()),
             Ok(SessionOutcome::Reconnect) => {
                 backoff.reset();
@@ -243,6 +318,7 @@ async fn connect_and_run(
     tun: Arc<TunDevice>,
     up: TransportKind,
     down: TransportKind,
+    control: &crate::control::Control,
 ) -> Result<SessionOutcome> {
     let role = cfg.role;
     let send_t = transport::build(up, cfg, role).await?;
@@ -271,7 +347,15 @@ async fn connect_and_run(
                 fut.await?
             }
         }
-        Role::Server => server_handshake(&*send_t, &*recv_t, hs_params).await?,
+        Role::Server => {
+            server_handshake(
+                &*send_t,
+                &*recv_t,
+                hs_params,
+                cfg.observability.handshake_rate_limit,
+            )
+            .await?
+        }
     };
     info!(
         session = format_args!("{:#018x}", session.session_id),
@@ -280,12 +364,30 @@ async fn connect_and_run(
         "session established"
     );
     log_overhead(cfg, up);
+    control.set_status(format!(
+        "{:?} up: {}/{} session={:#018x} pq={}",
+        role,
+        up.as_str(),
+        down.as_str(),
+        session.session_id,
+        session.pq_active
+    ));
 
-    Ok(run_session(cfg.clone(), tun, send_t, recv_t, Arc::new(session), up).await)
+    Ok(run_session(
+        cfg.clone(),
+        tun,
+        send_t,
+        recv_t,
+        Arc::new(session),
+        up,
+        control.clone(),
+    )
+    .await)
 }
 
 /// Spawn the data-plane tasks + keepalive + hopping, and supervise until the
 /// session ends (dead peer / fatal error) or shutdown.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     cfg: Arc<Config>,
     tun: Arc<TunDevice>,
@@ -293,9 +395,12 @@ async fn run_session(
     recv_t: Arc<dyn Transport>,
     session: Arc<SessionCrypto>,
     up: TransportKind,
+    control: crate::control::Control,
 ) -> SessionOutcome {
     let plane = PlaneParams::from_config(&cfg, up);
     let life = Life::new();
+    let metrics = control.metrics().clone();
+    metrics.set_active_tunnels(1);
 
     let mut handles = Vec::new();
     handles.push(tokio::spawn(tun_to_net(
@@ -304,6 +409,7 @@ async fn run_session(
         session.clone(),
         plane,
         life.clone(),
+        metrics.clone(),
     )));
     handles.push(tokio::spawn(net_to_tun(
         tun.clone(),
@@ -312,6 +418,7 @@ async fn run_session(
         session.clone(),
         plane,
         life.clone(),
+        metrics.clone(),
     )));
 
     // Endpoint hopping (client only): rotate among server endpoints on a
@@ -331,10 +438,21 @@ async fn run_session(
 
     let _guard = AbortGuard(handles);
 
-    tokio::select! {
+    let outcome = tokio::select! {
         _ = life.ended.notified() => SessionOutcome::Reconnect,
+        _ = control.rekey().notified() => {
+            info!("rekey/transport-switch requested; restarting session");
+            control.metrics().inc_rekeys();
+            SessionOutcome::Reconnect
+        }
+        _ = control.reload().notified() => {
+            info!("reload requested; restarting session");
+            SessionOutcome::Reconnect
+        }
         _ = wait_for_shutdown() => SessionOutcome::Shutdown,
-    }
+    };
+    control.metrics().set_active_tunnels(0);
+    outcome
 }
 
 /// Rotate the send transport's endpoint on a time-synchronized schedule.
@@ -412,19 +530,37 @@ async fn client_handshake(
     }
 }
 
-/// Server side: wait for a valid Handshake1, authenticate, reply.
+/// Server side: wait for a valid Handshake1, rate-limit per source, then
+/// authenticate and reply. Unauthenticated/over-limit traffic is dropped
+/// silently (fail-closed, anti-probing).
 async fn server_handshake(
     send_t: &dyn Transport,
     recv_t: &dyn Transport,
     params: crypto::HandshakeParams,
+    rate_limit: u32,
 ) -> Result<SessionCrypto> {
     let mut buf = vec![0u8; RECV_CAP];
+    let mut limiter = HandshakeRateLimiter::new(rate_limit);
     loop {
-        let body = match wait_for_type(recv_t, &mut buf, FrameType::Handshake1).await {
-            Ok(b) => b,
+        let (n, src) = match recv_t.recv_frame_from(&mut buf).await {
+            Ok(x) => x,
             Err(e) if e.is_droppable() => continue,
             Err(e) => return Err(e),
         };
+        let (h, body) = match Header::decode(&buf[..n]) {
+            Ok((h, b)) if h.ftype == FrameType::Handshake1 => (h, b.to_vec()),
+            _ => continue, // not a handshake-1 — ignore
+        };
+        let _ = h;
+
+        // Anti-abuse: rate-limit handshake attempts per source address.
+        if let Some(ip) = src {
+            if !limiter.allow(ip, unix_millis()) {
+                debug!(peer = %ip, "handshake rate-limited");
+                continue;
+            }
+        }
+
         let responder = crypto::Responder::start(params.clone())?;
         match responder.respond(&body) {
             Ok((msg2, result)) => {
@@ -438,6 +574,42 @@ async fn server_handshake(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Per-source sliding-window handshake rate limiter (server anti-abuse).
+struct HandshakeRateLimiter {
+    max_per_min: u32,
+    seen: std::collections::HashMap<std::net::Ipv4Addr, (u64, u32)>,
+}
+
+impl HandshakeRateLimiter {
+    fn new(max_per_min: u32) -> HandshakeRateLimiter {
+        HandshakeRateLimiter {
+            max_per_min,
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Returns true if an attempt from `ip` at `now_ms` is within the limit.
+    fn allow(&mut self, ip: std::net::Ipv4Addr, now_ms: u64) -> bool {
+        if self.max_per_min == 0 {
+            return true; // disabled
+        }
+        let window = now_ms / 60_000;
+        let entry = self.seen.entry(ip).or_insert((window, 0));
+        if entry.0 != window {
+            *entry = (window, 0);
+        }
+        entry.1 += 1;
+        // Opportunistically bound the table size.
+        if self.seen.len() > 10_000 {
+            self.seen.retain(|_, (w, _)| *w == window);
+        }
+        self.seen
+            .get(&ip)
+            .map(|(_, c)| *c <= self.max_per_min)
+            .unwrap_or(true)
     }
 }
 
@@ -536,19 +708,24 @@ async fn emit_frame(
     Ok(())
 }
 
-/// Emit a sealed frame after an optional timing-jitter delay.
+/// Emit a sealed frame after an optional timing-jitter delay, recording metrics.
 async fn emit_with_jitter(
     send_t: &dyn Transport,
     fec: &mut Option<FecEncoder>,
     frame: &[u8],
     jitter_ms: u64,
+    metrics: &Metrics,
 ) {
     let d = obfs::shaping::jitter(jitter_ms);
     if !d.is_zero() {
         tokio::time::sleep(d).await;
     }
-    if let Err(e) = emit_frame(send_t, fec, frame).await {
-        warn!(err = %e, "transport send error");
+    match emit_frame(send_t, fec, frame).await {
+        Ok(()) => {
+            metrics.add_tx(frame.len());
+            metrics.add_transport_tx(send_t.kind().as_str(), frame.len());
+        }
+        Err(e) => warn!(err = %e, "transport send error"),
     }
 }
 
@@ -561,6 +738,7 @@ async fn tun_to_net(
     session: Arc<SessionCrypto>,
     plane: PlaneParams,
     life: Life,
+    metrics: Metrics,
 ) {
     let mut tx_counter: u64 = 0;
     let mut inbuf = vec![0u8; plane.mtu + 256];
@@ -614,18 +792,18 @@ async fn tun_to_net(
                 last_tx = unix_millis();
                 if let Some(a) = &mut acc {
                     if a.would_overflow(n) {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane).await;
+                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane, &metrics).await;
                     }
                     let _ = a.push(&inbuf[..n]);
                     if a.encoded_len() >= plane.mux_max_payload {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane).await;
+                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane, &metrics).await;
                     }
                 } else {
                     let counter = tx_counter;
                     tx_counter += 1;
                     let pad = plane.obfs.frame_pad(overhead);
                     match seal_frame(&session, counter, 0, &inbuf[..n], &pad) {
-                        Ok(frame) => emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms).await,
+                        Ok(frame) => emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms, &metrics).await,
                         Err(e) => warn!(err = %e, "seal failed (rekey needed?)"),
                     }
                 }
@@ -633,7 +811,7 @@ async fn tun_to_net(
             _ = mux_ticker.tick(), if acc.is_some() => {
                 if let Some(a) = &mut acc {
                     if !a.is_empty() {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane).await;
+                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane, &metrics).await;
                     }
                 }
             }
@@ -642,7 +820,7 @@ async fn tun_to_net(
                 tx_counter += 1;
                 let pad = plane.obfs.frame_pad(overhead);
                 if let Ok(frame) = seal_chaff(&session, counter, &pad) {
-                    emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms).await;
+                    emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms, &metrics).await;
                     last_tx = unix_millis();
                 }
             }
@@ -660,7 +838,7 @@ async fn tun_to_net(
                     tx_counter += 1;
                     let pad = plane.obfs.frame_pad(overhead);
                     if let Ok(frame) = seal_typed(&session, FrameType::Keepalive, counter, 0, &[], &pad) {
-                        emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms).await;
+                        emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms, &metrics).await;
                         last_tx = now;
                     }
                 }
@@ -670,6 +848,7 @@ async fn tun_to_net(
 }
 
 /// Flush the mux accumulator as one padded, batched Data frame.
+#[allow(clippy::too_many_arguments)]
 async fn flush_batch(
     send_t: &Arc<dyn Transport>,
     session: &Arc<SessionCrypto>,
@@ -677,19 +856,23 @@ async fn flush_batch(
     fec: &mut Option<FecEncoder>,
     acc: &mut BatchAccumulator,
     plane: &PlaneParams,
+    metrics: &Metrics,
 ) {
     let Some(batch) = acc.take() else { return };
     let counter = *tx_counter;
     *tx_counter += 1;
     let pad = plane.obfs.frame_pad(HEADER_LEN + crypto::TAG_LEN);
     match seal_frame(session, counter, flags::MUX_BATCH, &batch, &pad) {
-        Ok(frame) => emit_with_jitter(&**send_t, fec, &frame, plane.obfs.timing_jitter_ms).await,
+        Ok(frame) => {
+            emit_with_jitter(&**send_t, fec, &frame, plane.obfs.timing_jitter_ms, metrics).await
+        }
         Err(e) => warn!(err = %e, "seal batch failed"),
     }
 }
 
 /// `net → tun`: FEC reconstruct (optional), decrypt, debatch (if mux), deliver,
 /// plus liveness tracking and auth-gated connection migration.
+#[allow(clippy::too_many_arguments)]
 async fn net_to_tun(
     tun: Arc<TunDevice>,
     recv_t: Arc<dyn Transport>,
@@ -697,6 +880,7 @@ async fn net_to_tun(
     session: Arc<SessionCrypto>,
     plane: PlaneParams,
     life: Life,
+    metrics: Metrics,
 ) {
     use crate::crypto::ReplayWindow;
     let mut replay = ReplayWindow::new(plane.replay_window);
@@ -723,13 +907,17 @@ async fn net_to_tun(
             continue;
         }
         life.mark_rx();
+        metrics.add_rx(n);
 
         // FEC stage (if enabled) yields 0+ sealed frames; otherwise the
         // datagram is the sealed frame.
         let sealed_frames: Vec<Vec<u8>> = if let Some(d) = &mut dec {
             match d.push(&buf[..n]) {
                 Ok(v) => v,
-                Err(_) => continue, // malformed FEC datagram — drop
+                Err(_) => {
+                    metrics.drop_frame(drop_reason::DECODE);
+                    continue; // malformed FEC datagram — drop
+                }
             }
         } else {
             vec![buf[..n].to_vec()]
@@ -737,7 +925,7 @@ async fn net_to_tun(
 
         let mut authed = false;
         for frame in sealed_frames {
-            authed |= process_sealed(&tun, &session, &mut replay, &frame).await;
+            authed |= process_sealed(&tun, &session, &mut replay, &frame, &metrics).await;
         }
 
         // Connection migration: once an authenticated frame arrives from a new
@@ -762,30 +950,40 @@ async fn process_sealed(
     session: &SessionCrypto,
     replay: &mut crate::crypto::ReplayWindow,
     frame: &[u8],
+    metrics: &Metrics,
 ) -> bool {
     if frame.len() < HEADER_LEN {
+        metrics.drop_frame(drop_reason::DECODE);
         return false;
     }
     let (header, _) = match Header::decode(frame) {
         Ok(x) => x,
-        Err(_) => return false, // malformed — drop silently
+        Err(_) => {
+            metrics.drop_frame(drop_reason::DECODE);
+            return false; // malformed — drop silently
+        }
     };
     match header.ftype {
         FrameType::Data => {
             if !replay.check_and_update(header.counter) {
                 debug!(counter = header.counter, "replay/stale frame dropped");
+                metrics.drop_frame(drop_reason::REPLAY);
                 return false;
             }
             let aad = &frame[..HEADER_LEN];
             let mut body = frame[HEADER_LEN..].to_vec();
             if session.rx.open(header.counter, aad, &mut body).is_err() {
+                metrics.drop_frame(drop_reason::AEAD);
                 return false; // fail-closed
             }
             // Strip padding if present, then (if batched) split.
             let payload: &[u8] = if header.flags & flags::PADDED != 0 {
                 match obfs::padding::strip(&body) {
                     Some(p) => p,
-                    None => return false, // malformed padding trailer — drop
+                    None => {
+                        metrics.drop_frame(drop_reason::DECODE);
+                        return false; // malformed padding trailer — drop
+                    }
                 }
             } else {
                 &body
@@ -921,7 +1119,7 @@ mod tests {
         let sp = params(s_priv, c_pub);
 
         let server = tokio::spawn(async move {
-            let sess = server_handshake(&server_t, &server_t, sp).await.unwrap();
+            let sess = server_handshake(&server_t, &server_t, sp, 0).await.unwrap();
             (sess, server_t)
         });
         let client_sess = client_handshake(&client_t, &client_t, cp).await.unwrap();

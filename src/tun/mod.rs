@@ -1,9 +1,11 @@
 //! TUN device, NAT/firewall, routing, kill switch.
 //!
-//! Milestone 1 provides the async TUN device ([`device`]). The firewall/NAT,
-//! routing modes, kill switch and DNS handling are layered on in later
-//! milestones ([`firewall`], [`routing`]).
+//! * [`device`] — the async TUN device (TUNSETIFF + AsyncFd).
+//! * [`firewall`] — sysctls, NAT, port forwarding, kill switch, routing and
+//!   DNS, with clean teardown.
 
 pub mod device;
+pub mod firewall;
 
 pub use device::TunDevice;
+pub use firewall::Firewall;

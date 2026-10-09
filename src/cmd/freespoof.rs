@@ -56,6 +56,24 @@ impl From<RoleArg> for Role {
 enum Cmd {
     /// تولید یک جفت‌کلید استاتیک Noise (X25519) جدید و چاپ آن به صورت base64
     Genkey,
+    /// ساخت کانفیگ کلاینت از روی کانفیگ سرور + تولید لینک اشتراک base64
+    Pair {
+        /// مسیر کانفیگ سرور
+        #[arg(long)]
+        server_config: PathBuf,
+        /// مسیر خروجی کانفیگ کلاینت (پیش‌فرض: چاپ در stdout)
+        #[arg(long)]
+        client_out: Option<PathBuf>,
+    },
+    /// ارسال یک فرمان مدیریتی به نمونه‌ی در حال اجرا از طریق سوکت کنترل
+    Ctl {
+        /// مسیر سوکت کنترل یونیکس
+        #[arg(long, default_value = "/run/freespoof.sock")]
+        socket: String,
+        /// فرمان: stats | status | rotate-key | switch-transport <kind> | reload
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -69,6 +87,36 @@ fn main() -> Result<()> {
             println!("# و کلید عمومی را در peer_public_key طرف مقابل بگذارید.");
             println!("static_private_key = \"{}\"", kp.private_b64);
             println!("static_public_key  = \"{}\"", kp.public_b64);
+            Ok(())
+        }
+        Some(Cmd::Pair {
+            server_config,
+            client_out,
+        }) => {
+            let pairing = freespoof::app::generate_client_config(&server_config)
+                .context("generating client config")?;
+            if let Some(path) = client_out {
+                std::fs::write(&path, &pairing.client_toml).context("writing client config")?;
+                eprintln!("# کانفیگ کلاینت در {} نوشته شد", path.display());
+            } else {
+                println!("{}", pairing.client_toml);
+            }
+            eprintln!("\n# لینک اشتراک (این را به کلاینت بدهید):");
+            eprintln!("{}", pairing.share_link);
+            eprintln!("\n# این کلید عمومی کلاینت را به peer_public_key یا spoof.allowed_peers سرور اضافه کنید:");
+            eprintln!("{}", pairing.client_public_hex);
+            Ok(())
+        }
+        Some(Cmd::Ctl { socket, command }) => {
+            let cmd = command.join(" ");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building runtime")?;
+            let reply = rt
+                .block_on(freespoof::control::client(&socket, &cmd))
+                .context("control request")?;
+            print!("{reply}");
             Ok(())
         }
         None => {

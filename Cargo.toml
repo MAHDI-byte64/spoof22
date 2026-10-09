@@ -92,7 +92,6 @@ anyhow = "1"
 # --- Logging / observability ------------------------------------------------
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "json"] }
-prometheus = { version = "0.14", default-features = false }
 
 # --- CLI --------------------------------------------------------------------
 clap = { version = "4", features = ["derive", "env"] }
