@@ -63,6 +63,12 @@ impl RawIpSocket {
         self.protocol
     }
 
+    /// The underlying OS file descriptor (for the optional io_uring backend).
+    #[cfg(feature = "io_uring")]
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.afd.get_ref().as_raw_fd()
+    }
+
     /// Send a fully-formed IPv4 packet (header + payload) to `dst`.
     ///
     /// With `IP_HDRINCL` the kernel takes the source from our header (forged),

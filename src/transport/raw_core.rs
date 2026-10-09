@@ -36,6 +36,9 @@ pub struct RawCore {
     /// Validated inbound payloads drained from a `recvmmsg` burst, served one
     /// at a time by [`RawCore::recv_l4`] (shared across the per-tunnel tasks).
     recv_q: Mutex<VecDeque<(Vec<u8>, Ipv4Addr)>>,
+    /// Optional io_uring backend for the batched send path (feature-gated).
+    #[cfg(feature = "io_uring")]
+    uring: Option<std::sync::Arc<crate::spoof::uring::UringSender>>,
 }
 
 impl RawCore {
@@ -53,6 +56,14 @@ impl RawCore {
             protocol,
             ip_id: IpIdCounter::new(),
             recv_q: Mutex::new(VecDeque::new()),
+            #[cfg(feature = "io_uring")]
+            uring: match crate::spoof::uring::UringSender::new(256) {
+                Ok(s) => Some(std::sync::Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!(err = %e, "io_uring init failed; using sendmmsg path");
+                    None
+                }
+            },
         })
     }
 
@@ -103,6 +114,24 @@ impl RawCore {
                 })
             })
             .collect();
+        // With the io_uring feature, route the batch through the ring on a
+        // blocking thread (the backend blocks on submit_and_wait); otherwise
+        // use the sendmmsg(2) path. Both fall back gracefully.
+        #[cfg(feature = "io_uring")]
+        if let Some(sender) = &self.uring {
+            use std::os::fd::RawFd;
+            let fd: RawFd = self.raw.raw_fd();
+            let sender = sender.clone();
+            let owned: Vec<(Vec<u8>, Ipv4Addr)> = pkts.iter().map(|p| (p.clone(), dst)).collect();
+            let res = tokio::task::spawn_blocking(move || sender.send_batch_blocking(fd, &owned))
+                .await
+                .map_err(|e| {
+                    crate::error::Error::transport("raw", format!("io_uring join: {e}"))
+                })?;
+            res.map_err(crate::error::Error::from)?;
+            return Ok(());
+        }
+
         let refs: Vec<(&[u8], Ipv4Addr)> = pkts.iter().map(|p| (p.as_slice(), dst)).collect();
         self.raw.send_mmsg(&refs).await?;
         Ok(())

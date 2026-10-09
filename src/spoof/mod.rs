@@ -8,6 +8,8 @@
 pub mod checksum;
 pub mod ipv4;
 pub mod socket;
+#[cfg(feature = "io_uring")]
+pub mod uring;
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU16, Ordering};

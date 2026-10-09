@@ -24,8 +24,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (io_uring feature)
+        run: cargo clippy --all-targets --features io_uring -- -D warnings
       - name: test
         run: cargo test --all
+      - name: build (io_uring feature)
+        run: cargo build --features io_uring
 
   cross-build:
     name: build ${{ matrix.target }}

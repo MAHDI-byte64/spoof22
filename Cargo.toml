@@ -12,6 +12,13 @@ authors = ["freespoof authors"]
 # and `freespoof-server` are thin role-locked entry points over the same library.
 default-run = "freespoof"
 
+[features]
+default = []
+# Route the raw-socket batched send path through io_uring instead of
+# sendmmsg(2). Opt-in (`--features io_uring`); the default build never pulls
+# the io-uring crate or touches the kernel's io_uring interface.
+io_uring = ["dep:io-uring"]
+
 [lib]
 name = "freespoof"
 path = "src/lib.rs"
@@ -103,6 +110,9 @@ libc = "0.2"
 # --- Sandboxing (Linux LSM + seccomp-bpf; both best-effort at runtime) ------
 landlock = "0.4"                                # filesystem access restriction (Landlock LSM)
 seccompiler = { version = "0.5", default-features = false }  # seccomp-bpf syscall deny-list
+
+# --- Optional io_uring raw send backend (feature `io_uring`, off by default) -
+io-uring = { version = "0.7", optional = true }
 
 # --- Data structures / utilities --------------------------------------------
 bytes = "1"
