@@ -15,12 +15,13 @@
 //! observed sequence numbers into [`TcpTransport::ack`].
 
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 
 use crate::config::TransportKind;
 use crate::error::Result;
+use crate::obfs::utls;
 use crate::spoof::checksum;
 
 use super::raw_core::RawCore;
@@ -40,6 +41,10 @@ pub struct TcpTransport {
     src_port: u16,
     dst_port: u16,
     fake_tls: bool,
+    /// Prebuilt browser ClientHello to emit as the first segment (client side).
+    utls_hello: Option<Vec<u8>>,
+    /// Whether the uTLS ClientHello first flight has been sent yet.
+    hello_sent: AtomicBool,
     seq: AtomicU32,
     ack: AtomicU32,
 }
@@ -56,6 +61,8 @@ impl TcpTransport {
             src_port: p.data_port,
             dst_port: p.data_port,
             fake_tls: p.fake_tls,
+            utls_hello: p.utls_hello.clone(),
+            hello_sent: AtomicBool::new(false),
             seq: AtomicU32::new(u32::from_be_bytes(seed)),
             ack: AtomicU32::new(0),
         })
@@ -96,6 +103,20 @@ impl Transport for TcpTransport {
     }
 
     async fn send_frame(&self, frame: &[u8]) -> Result<()> {
+        // Emit the browser ClientHello as the very first segment so the flow's
+        // JA3 matches a real browser. It rides its own PSH|ACK segment and is
+        // sent exactly once; the peer skips a leading ClientHello-looking
+        // record (see `recv_frame`).
+        if let Some(hello) = &self.utls_hello {
+            if self
+                .hello_sent
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let seg = self.build_segment(hello);
+                self.core.send_l4(&seg).await?;
+            }
+        }
         // Optional fake TLS Application-Data record around the frame.
         let payload = if self.fake_tls {
             let mut v = Vec::with_capacity(FAKE_TLS_HEADER + frame.len());
@@ -126,6 +147,9 @@ impl Transport for TcpTransport {
             let mut payload = &tmp[data_off..n];
             if payload.is_empty() {
                 continue; // pure ACK / control segment — skip
+            }
+            if utls::looks_like_client_hello(payload) {
+                continue; // peer's uTLS camouflage first flight — not a frame
             }
             if self.fake_tls {
                 if payload.len() < FAKE_TLS_HEADER {

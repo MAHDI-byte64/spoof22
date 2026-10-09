@@ -52,6 +52,9 @@ pub struct TransportParams {
     pub is_server: bool,
     /// Prepend a 5-byte fake TLS Application-Data record on the TCP transport.
     pub fake_tls: bool,
+    /// A prebuilt uTLS browser ClientHello to emit as the TCP transport's first
+    /// segment (client side), for a browser-matching JA3. `None` disables it.
+    pub utls_hello: Option<Vec<u8>>,
     /// TTL values chosen at random per packet (TTL jitter).
     pub ttl_pool: Vec<u8>,
     /// DSCP/TOS bytes chosen at random per packet.
@@ -76,6 +79,19 @@ impl TransportParams {
             icmp_id: cfg.transport.icmp_id,
             is_server: matches!(role, Role::Server),
             fake_tls: cfg.obfs.fake_tls_header,
+            utls_hello: if matches!(role, Role::Client)
+                && cfg.obfs.fake_tls_header
+                && !matches!(cfg.obfs.tls_fingerprint, crate::config::TlsFingerprint::Native)
+            {
+                let sni = if cfg.obfs.sni.trim().is_empty() {
+                    "www.cloudflare.com"
+                } else {
+                    cfg.obfs.sni.trim()
+                };
+                Some(crate::obfs::utls::client_hello(cfg.obfs.tls_fingerprint, sni))
+            } else {
+                None
+            },
             ttl_pool: if cfg.obfs.ttl_jitter.is_empty() {
                 vec![64]
             } else {

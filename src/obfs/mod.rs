@@ -15,6 +15,7 @@ pub mod padding;
 pub mod profiles;
 pub mod shaping;
 pub mod tls;
+pub mod utls;
 
 pub use padding::PadPolicy;
 
