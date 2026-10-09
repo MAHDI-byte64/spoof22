@@ -863,8 +863,13 @@ async fn emit_frame(send_t: &dyn Transport, plane: &Plane, frame: &[u8]) -> Resu
     } else {
         vec![frame.to_vec()]
     };
-    for d in &datagrams {
-        send_t.send_frame(d).await?;
+    if datagrams.len() == 1 {
+        send_t.send_frame(&datagrams[0]).await?;
+    } else {
+        // A data shard plus its parity shards: coalesce into one sendmmsg(2)
+        // on transports that support it (default falls back to a send loop).
+        let refs: Vec<&[u8]> = datagrams.iter().map(|d| d.as_slice()).collect();
+        send_t.send_batch(&refs).await?;
     }
     Ok(())
 }

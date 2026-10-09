@@ -4,15 +4,22 @@
 //! forged IPv4 header, sending on the raw socket, receiving + parsing +
 //! source/protocol filtering — is identical and lives here.
 
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 
 use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 
 use crate::error::Result;
 use crate::spoof::ipv4::{self, Ipv4Build};
 use crate::spoof::{IpIdCounter, RawIpSocket};
 
 use super::TransportParams;
+
+/// How many packets the batched receive path pulls per `recvmmsg` syscall.
+const RECV_BATCH: usize = 16;
+/// Per-message scratch size for the batched receive (jumbo-frame safe).
+const RECV_BUF: usize = 9216;
 
 /// A reusable raw-IPv4 send/receive core bound to one protocol.
 pub struct RawCore {
@@ -26,6 +33,9 @@ pub struct RawCore {
     dscp_pool: Vec<u8>,
     protocol: u8,
     ip_id: IpIdCounter,
+    /// Validated inbound payloads drained from a `recvmmsg` burst, served one
+    /// at a time by [`RawCore::recv_l4`] (shared across the per-tunnel tasks).
+    recv_q: Mutex<VecDeque<(Vec<u8>, Ipv4Addr)>>,
 }
 
 impl RawCore {
@@ -42,6 +52,7 @@ impl RawCore {
             dscp_pool: p.dscp_pool.clone(),
             protocol,
             ip_id: IpIdCounter::new(),
+            recv_q: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -67,29 +78,70 @@ impl RawCore {
         Ok(())
     }
 
+    /// Build IPv4 packets around each already-formed L4 payload and send the
+    /// whole set with one `sendmmsg(2)` syscall (per-packet TTL/DSCP/IP-ID are
+    /// still applied). All packets go to the current destination.
+    pub async fn send_l4_batch(&self, l4s: &[&[u8]]) -> Result<()> {
+        if l4s.is_empty() {
+            return Ok(());
+        }
+        if l4s.len() == 1 {
+            return self.send_l4(l4s[0]).await;
+        }
+        let dst = **self.dst.load();
+        let pkts: Vec<Vec<u8>> = l4s
+            .iter()
+            .map(|l4| {
+                ipv4::build(&Ipv4Build {
+                    src: self.src,
+                    dst,
+                    protocol: self.protocol,
+                    ttl: super::pick(&self.ttl_pool, 64),
+                    tos: super::pick(&self.dscp_pool, 0),
+                    id: self.ip_id.next(),
+                    payload: l4,
+                })
+            })
+            .collect();
+        let refs: Vec<(&[u8], Ipv4Addr)> = pkts.iter().map(|p| (p.as_slice(), dst)).collect();
+        self.raw.send_mmsg(&refs).await?;
+        Ok(())
+    }
+
     /// Receive one inbound packet of our protocol, validate the IPv4 header,
     /// filter by expected source, and copy the L4 payload into `out`,
-    /// returning `(payload_len, observed_source)`. Non-matching packets are
-    /// skipped. (A buffer-pool optimization replaces the per-call scratch
-    /// allocation in the performance milestone.)
+    /// returning `(payload_len, observed_source)`.
+    ///
+    /// Inbound packets are drained a burst at a time with `recvmmsg(2)` into an
+    /// internal queue and then served one per call, so a flood costs far fewer
+    /// syscalls than one `recv` per packet. The queue is shared across the
+    /// per-tunnel receive tasks; two tasks finding it empty simply pull two
+    /// bursts, which is harmless (frames are self-describing and order-
+    /// independent at this layer).
     pub async fn recv_l4(&self, out: &mut [u8]) -> Result<(usize, Ipv4Addr)> {
-        let mut scratch = vec![0u8; 65_535];
         loop {
-            let n = self.raw.recv(&mut scratch).await?;
-            let view = match ipv4::parse(&scratch[..n]) {
-                Ok(v) => v,
-                Err(_) => continue, // malformed IP — skip
-            };
-            if view.protocol != self.protocol {
-                continue;
+            if let Some((payload, src)) = self.recv_q.lock().pop_front() {
+                let m = payload.len().min(out.len());
+                out[..m].copy_from_slice(&payload[..m]);
+                return Ok((m, src));
             }
-            if !self.accept_any && view.src != self.expect_src {
-                continue; // not our peer's expected (forged) source — skip
+            // Queue empty — pull a fresh burst (no lock held across the await).
+            let mut bufs: Vec<Vec<u8>> = (0..RECV_BATCH).map(|_| vec![0u8; RECV_BUF]).collect();
+            let lens = self.raw.recv_mmsg(&mut bufs).await?;
+            let mut q = self.recv_q.lock();
+            for (buf, &len) in bufs.iter().zip(lens.iter()) {
+                let view = match ipv4::parse(&buf[..len]) {
+                    Ok(v) => v,
+                    Err(_) => continue, // malformed IP — skip
+                };
+                if view.protocol != self.protocol {
+                    continue;
+                }
+                if !self.accept_any && view.src != self.expect_src {
+                    continue; // not our peer's expected (forged) source — skip
+                }
+                q.push_back((view.payload.to_vec(), view.src));
             }
-            let payload = view.payload;
-            let m = payload.len().min(out.len());
-            out[..m].copy_from_slice(&payload[..m]);
-            return Ok((m, view.src));
         }
     }
 }

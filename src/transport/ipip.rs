@@ -39,6 +39,10 @@ impl Transport for IpipTransport {
         self.core.send_l4(frame).await
     }
 
+    async fn send_batch(&self, frames: &[&[u8]]) -> Result<()> {
+        self.core.send_l4_batch(frames).await
+    }
+
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize> {
         let (n, _src) = self.core.recv_l4(buf).await?;
         Ok(n)

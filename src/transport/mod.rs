@@ -81,14 +81,19 @@ impl TransportParams {
             fake_tls: cfg.obfs.fake_tls_header,
             utls_hello: if matches!(role, Role::Client)
                 && cfg.obfs.fake_tls_header
-                && !matches!(cfg.obfs.tls_fingerprint, crate::config::TlsFingerprint::Native)
-            {
+                && !matches!(
+                    cfg.obfs.tls_fingerprint,
+                    crate::config::TlsFingerprint::Native
+                ) {
                 let sni = if cfg.obfs.sni.trim().is_empty() {
                     "www.cloudflare.com"
                 } else {
                     cfg.obfs.sni.trim()
                 };
-                Some(crate::obfs::utls::client_hello(cfg.obfs.tls_fingerprint, sni))
+                Some(crate::obfs::utls::client_hello(
+                    cfg.obfs.tls_fingerprint,
+                    sni,
+                ))
             } else {
                 None
             },
@@ -126,6 +131,17 @@ pub trait Transport: Send + Sync {
 
     /// Send one wire frame to the peer.
     async fn send_frame(&self, frame: &[u8]) -> Result<()>;
+
+    /// Send several wire frames at once. Transports with a raw socket override
+    /// this to coalesce the set into a single `sendmmsg(2)` syscall (used e.g.
+    /// when FEC emits a data shard plus its parity shards together). The
+    /// default simply sends them in order.
+    async fn send_batch(&self, frames: &[&[u8]]) -> Result<()> {
+        for f in frames {
+            self.send_frame(f).await?;
+        }
+        Ok(())
+    }
 
     /// Receive one wire frame from the peer into `buf`, returning its length.
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize>;

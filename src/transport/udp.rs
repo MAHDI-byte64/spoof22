@@ -56,20 +56,14 @@ impl UdpTransport {
             ip_id: IpIdCounter::new(),
         })
     }
-}
 
-#[async_trait]
-impl Transport for UdpTransport {
-    fn kind(&self) -> TransportKind {
-        TransportKind::Udp
-    }
-
-    async fn send_frame(&self, frame: &[u8]) -> Result<()> {
+    /// Build the full IPv4+UDP packet for one frame to `dst` (forged source,
+    /// per-packet TTL/DSCP/IP-ID, UDP checksum).
+    fn build_packet(&self, frame: &[u8], dst: Ipv4Addr) -> Result<Vec<u8>> {
         let udp_len = 8 + frame.len();
         if udp_len > u16::MAX as usize {
             return Err(Error::transport("udp", "frame too large for one datagram"));
         }
-        let dst = **self.dst.load();
         let mut seg = Vec::with_capacity(udp_len);
         seg.extend_from_slice(&self.src_port.to_be_bytes());
         seg.extend_from_slice(&self.dst_port.to_be_bytes());
@@ -82,7 +76,7 @@ impl Transport for UdpTransport {
         let csum = if csum == 0 { 0xFFFF } else { csum };
         seg[6..8].copy_from_slice(&csum.to_be_bytes());
 
-        let pkt = ipv4::build(&Ipv4Build {
+        Ok(ipv4::build(&Ipv4Build {
             src: self.src,
             dst,
             protocol: 17,
@@ -90,8 +84,37 @@ impl Transport for UdpTransport {
             tos: super::pick(&self.dscp_pool, 0),
             id: self.ip_id.next(),
             payload: &seg,
-        });
+        }))
+    }
+}
+
+#[async_trait]
+impl Transport for UdpTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Udp
+    }
+
+    async fn send_frame(&self, frame: &[u8]) -> Result<()> {
+        let dst = **self.dst.load();
+        let pkt = self.build_packet(frame, dst)?;
         self.raw.send_to(&pkt, dst).await?;
+        Ok(())
+    }
+
+    async fn send_batch(&self, frames: &[&[u8]]) -> Result<()> {
+        if frames.len() < 2 {
+            if let Some(f) = frames.first() {
+                return self.send_frame(f).await;
+            }
+            return Ok(());
+        }
+        let dst = **self.dst.load();
+        let pkts: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|f| self.build_packet(f, dst))
+            .collect::<Result<_>>()?;
+        let refs: Vec<(&[u8], Ipv4Addr)> = pkts.iter().map(|p| (p.as_slice(), dst)).collect();
+        self.raw.send_mmsg(&refs).await?;
         Ok(())
     }
 

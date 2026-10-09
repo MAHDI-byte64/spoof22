@@ -32,6 +32,15 @@ impl GreTransport {
             core: RawCore::new(47, p)?,
         })
     }
+
+    /// Wrap one frame in the minimal GRE header.
+    fn wrap(frame: &[u8]) -> Vec<u8> {
+        let mut l4 = Vec::with_capacity(GRE_HEADER + frame.len());
+        l4.extend_from_slice(&0u16.to_be_bytes()); // flags + version = 0
+        l4.extend_from_slice(&GRE_PROTO_TEB.to_be_bytes());
+        l4.extend_from_slice(frame);
+        l4
+    }
 }
 
 #[async_trait]
@@ -41,11 +50,13 @@ impl Transport for GreTransport {
     }
 
     async fn send_frame(&self, frame: &[u8]) -> Result<()> {
-        let mut l4 = Vec::with_capacity(GRE_HEADER + frame.len());
-        l4.extend_from_slice(&0u16.to_be_bytes()); // flags + version = 0
-        l4.extend_from_slice(&GRE_PROTO_TEB.to_be_bytes());
-        l4.extend_from_slice(frame);
-        self.core.send_l4(&l4).await
+        self.core.send_l4(&Self::wrap(frame)).await
+    }
+
+    async fn send_batch(&self, frames: &[&[u8]]) -> Result<()> {
+        let msgs: Vec<Vec<u8>> = frames.iter().map(|f| Self::wrap(f)).collect();
+        let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+        self.core.send_l4_batch(&refs).await
     }
 
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize> {

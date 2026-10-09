@@ -259,8 +259,8 @@ fn install_seccomp() -> std::result::Result<usize, Box<dyn std::error::Error>> {
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,                        // default: allow unlisted
-        SeccompAction::Errno(libc::EPERM as u32),    // listed: deny with EPERM
+        SeccompAction::Allow,                     // default: allow unlisted
+        SeccompAction::Errno(libc::EPERM as u32), // listed: deny with EPERM
         SECCOMP_ARCH,
     )?;
     let prog: BpfProgram = filter.try_into()?;

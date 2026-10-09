@@ -78,6 +78,12 @@ impl Transport for IcmpTransport {
         self.core.send_l4(&msg).await
     }
 
+    async fn send_batch(&self, frames: &[&[u8]]) -> Result<()> {
+        let msgs: Vec<Vec<u8>> = frames.iter().map(|f| self.build(f)).collect();
+        let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+        self.core.send_l4_batch(&refs).await
+    }
+
     async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize> {
         let (m, _src) = self.recv_inner(buf).await?;
         Ok(m)
