@@ -15,19 +15,21 @@
 //! Transport racing, failover, endpoint/port hopping, migration and
 //! auto-reconnect are layered on in the session-lifecycle milestone.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, FecMode, Role, TransportKind};
-use crate::crypto::{self, SessionCrypto};
+use crate::crypto::{self, ReplayWindow, SessionCrypto};
 use crate::error::{Error, Result};
 use crate::fec::{FecDecoder, FecEncoder};
 use crate::metrics::{drop_reason, Metrics};
 use crate::mux::{self, BatchAccumulator};
 use crate::obfs::{self, Obfs};
-use crate::reliability::Backoff;
+use crate::reliability::{Backoff, Congestion};
 use crate::transport::{self, Transport};
 use crate::tun::TunDevice;
 use crate::wire::{flags, FrameType, Header, HEADER_LEN};
@@ -55,6 +57,11 @@ struct PlaneParams {
     data_port: u16,
     is_server: bool,
     replay_window: u32,
+    /// Number of parallel tunnel streams (from auto-tune or config).
+    tunnel_count: usize,
+    /// Whether feedback-driven congestion control is active (non-QUIC paths).
+    cong_enabled: bool,
+    cong_kind: crate::config::CongestionKind,
 }
 
 impl PlaneParams {
@@ -65,6 +72,18 @@ impl PlaneParams {
         // Shard must hold the largest sealed frame + padding + length prefix.
         let max_frame =
             HEADER_LEN + mux_max.max(mtu) + crypto::TAG_LEN + cfg.obfs.packet_padding_max;
+
+        // Resolve the parallel-stream count from the auto-tuner (or config).
+        let tunnel_count = {
+            let hw = crate::tune::HwInfo::detect(&cfg.transport.interface);
+            crate::tune::plan(cfg, hw).tunnel_count.max(1)
+        };
+        let cong_enabled = datagram
+            && !matches!(
+                cfg.reliability.congestion,
+                crate::config::CongestionKind::None
+            );
+
         PlaneParams {
             mtu,
             mux_enabled: datagram && cfg.mux.enable_multiplex,
@@ -83,6 +102,9 @@ impl PlaneParams {
             data_port: cfg.transport.data_port,
             is_server: matches!(cfg.role, Role::Server),
             replay_window: cfg.crypto.replay_window,
+            tunnel_count,
+            cong_enabled,
+            cong_kind: cfg.reliability.congestion,
         }
     }
 }
@@ -131,6 +153,99 @@ impl Drop for AbortGuard {
             h.abort();
         }
     }
+}
+
+/// Control-frame subtypes (first plaintext byte of a sealed `Control` frame).
+mod ctrl {
+    /// Congestion/loss feedback report.
+    pub const STATS: u8 = 1;
+}
+
+/// Feedback-driven congestion state shared between a session's sender and
+/// receiver tasks. The sender reads [`Cong::pacing_nanos`] (lock-free) each
+/// packet; the receiver updates the controller only when a STATS report
+/// arrives, so the hot path never contends on the mutex.
+#[derive(Clone)]
+struct Cong {
+    mss: usize,
+    /// Data frames we have sent (for the peer's loss estimate of our stream).
+    tx_data: Arc<AtomicU64>,
+    /// Data frames we have received (reported to the peer in our STATS).
+    rx_data: Arc<AtomicU64>,
+    /// The peer's latest STATS timestamp, to echo back for an RTT sample.
+    last_peer_ts: Arc<AtomicU64>,
+    /// Inter-packet pacing for our sender in nanoseconds (0 = unpaced).
+    pacing_nanos: Arc<AtomicU64>,
+    ctl: Arc<Mutex<Congestion>>,
+    fb: Arc<Mutex<Feedback>>,
+}
+
+impl Cong {
+    fn new(kind: crate::config::CongestionKind, mss: usize) -> Cong {
+        Cong {
+            mss,
+            tx_data: Arc::new(AtomicU64::new(0)),
+            rx_data: Arc::new(AtomicU64::new(0)),
+            last_peer_ts: Arc::new(AtomicU64::new(0)),
+            pacing_nanos: Arc::new(AtomicU64::new(0)),
+            ctl: Arc::new(Mutex::new(Congestion::new(kind))),
+            fb: Arc::new(Mutex::new(Feedback::default())),
+        }
+    }
+}
+
+/// Previous-sample snapshot for computing per-interval deltas.
+#[derive(Default)]
+struct Feedback {
+    prev_sent: u64,
+    prev_recv: u64,
+}
+
+/// Shared data-plane state across all parallel tunnel streams of one session.
+#[derive(Clone)]
+struct Plane {
+    params: PlaneParams,
+    session: Arc<SessionCrypto>,
+    metrics: Metrics,
+    life: Life,
+    /// Monotonic nonce counter, shared so the nonce never repeats under a key
+    /// even across parallel streams.
+    tx_counter: Arc<AtomicU64>,
+    /// Inbound anti-replay window, shared across receiver streams.
+    replay: Arc<Mutex<ReplayWindow>>,
+    /// FEC encoder/decoder, serialized across streams when FEC is enabled.
+    fec_enc: Option<Arc<Mutex<FecEncoder>>>,
+    fec_dec: Option<Arc<Mutex<FecDecoder>>>,
+    /// Congestion control, when active.
+    cong: Option<Cong>,
+}
+
+impl Plane {
+    /// Next nonce counter (unique across streams).
+    fn next_counter(&self) -> u64 {
+        self.tx_counter.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// Encode a STATS control body: `[subtype | rx_data | my_ts | echo_ts]`.
+fn encode_stats(rx_data: u64, my_ts: u64, echo_ts: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 24);
+    v.push(ctrl::STATS);
+    v.extend_from_slice(&rx_data.to_be_bytes());
+    v.extend_from_slice(&my_ts.to_be_bytes());
+    v.extend_from_slice(&echo_ts.to_be_bytes());
+    v
+}
+
+/// Strictly decode a STATS control body.
+fn decode_stats(b: &[u8]) -> Option<(u64, u64, u64)> {
+    if b.len() < 25 || b[0] != ctrl::STATS {
+        return None;
+    }
+    let rx = u64::from_be_bytes(b[1..9].try_into().ok()?);
+    let my_ts = u64::from_be_bytes(b[9..17].try_into().ok()?);
+    let echo = u64::from_be_bytes(b[17..25].try_into().ok()?);
+    Some((rx, my_ts, echo))
 }
 
 /// The running engine for one endpoint.
@@ -397,29 +512,72 @@ async fn run_session(
     up: TransportKind,
     control: crate::control::Control,
 ) -> SessionOutcome {
-    let plane = PlaneParams::from_config(&cfg, up);
+    let params = PlaneParams::from_config(&cfg, up);
     let life = Life::new();
     let metrics = control.metrics().clone();
-    metrics.set_active_tunnels(1);
+    let streams = params.tunnel_count.max(1);
+    metrics.set_active_tunnels(streams as u64);
+
+    // Shared FEC enc/dec (serialized across streams) when FEC is enabled.
+    let fec_enc = if params.fec_enabled {
+        match FecEncoder::new(
+            params.fec_mode,
+            params.fec_data_shards,
+            params.fec_parity_shards,
+            params.shard_len,
+        ) {
+            Ok(e) => Some(Arc::new(Mutex::new(e))),
+            Err(e) => {
+                warn!(err = %e, "FEC disabled: encoder init failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let fec_dec = if params.fec_enabled && fec_enc.is_some() {
+        Some(Arc::new(Mutex::new(FecDecoder::new(
+            params.fec_mode,
+            params.fec_max_groups,
+        ))))
+    } else {
+        None
+    };
+    let cong = if params.cong_enabled {
+        Some(Cong::new(params.cong_kind, params.mtu))
+    } else {
+        None
+    };
+
+    let plane = Plane {
+        params,
+        session: session.clone(),
+        metrics: metrics.clone(),
+        life: life.clone(),
+        tx_counter: Arc::new(AtomicU64::new(0)),
+        replay: Arc::new(Mutex::new(ReplayWindow::new(params.replay_window))),
+        fec_enc,
+        fec_dec,
+        cong,
+    };
+
+    info!(streams, cong = plane.cong.is_some(), "data plane starting");
 
     let mut handles = Vec::new();
-    handles.push(tokio::spawn(tun_to_net(
-        tun.clone(),
-        send_t.clone(),
-        session.clone(),
-        plane,
-        life.clone(),
-        metrics.clone(),
-    )));
-    handles.push(tokio::spawn(net_to_tun(
-        tun.clone(),
-        recv_t.clone(),
-        send_t.clone(),
-        session.clone(),
-        plane,
-        life.clone(),
-        metrics.clone(),
-    )));
+    for i in 0..streams {
+        handles.push(tokio::spawn(tun_to_net(
+            tun.clone(),
+            send_t.clone(),
+            plane.clone(),
+            i,
+        )));
+        handles.push(tokio::spawn(net_to_tun(
+            tun.clone(),
+            recv_t.clone(),
+            send_t.clone(),
+            plane.clone(),
+        )));
+    }
 
     // Endpoint hopping (client only): rotate among server endpoints on a
     // wall-clock schedule both sides compute identically.
@@ -690,42 +848,101 @@ fn seal_chaff(session: &SessionCrypto, counter: u64, pad: &obfs::PadPolicy) -> R
     seal_typed(session, FrameType::Chaff, counter, 0, &body, pad)
 }
 
-/// Send a sealed frame, applying FEC if enabled.
-async fn emit_frame(
-    send_t: &dyn Transport,
-    fec: &mut Option<FecEncoder>,
-    frame: &[u8],
-) -> Result<()> {
-    if let Some(enc) = fec {
-        let out = enc.push(frame)?;
-        send_t.send_frame(&out.data).await?;
-        for p in out.parity {
-            send_t.send_frame(&p).await?;
-        }
+/// Send a sealed frame, applying FEC (shared encoder) if enabled. The FEC
+/// mutex is held only for the synchronous `push`, never across the send.
+async fn emit_frame(send_t: &dyn Transport, plane: &Plane, frame: &[u8]) -> Result<()> {
+    let datagrams: Vec<Vec<u8>> = if let Some(enc) = &plane.fec_enc {
+        let out = { enc.lock().push(frame)? };
+        let mut v = Vec::with_capacity(1 + out.parity.len());
+        v.push(out.data);
+        v.extend(out.parity);
+        v
     } else {
-        send_t.send_frame(frame).await?;
+        vec![frame.to_vec()]
+    };
+    for d in &datagrams {
+        send_t.send_frame(d).await?;
     }
     Ok(())
 }
 
 /// Emit a sealed frame after an optional timing-jitter delay, recording metrics.
-async fn emit_with_jitter(
-    send_t: &dyn Transport,
-    fec: &mut Option<FecEncoder>,
-    frame: &[u8],
-    jitter_ms: u64,
-    metrics: &Metrics,
-) {
-    let d = obfs::shaping::jitter(jitter_ms);
+async fn emit_with_jitter(send_t: &dyn Transport, plane: &Plane, frame: &[u8]) {
+    let d = obfs::shaping::jitter(plane.params.obfs.timing_jitter_ms);
     if !d.is_zero() {
         tokio::time::sleep(d).await;
     }
-    match emit_frame(send_t, fec, frame).await {
+    match emit_frame(send_t, plane, frame).await {
         Ok(()) => {
-            metrics.add_tx(frame.len());
-            metrics.add_transport_tx(send_t.kind().as_str(), frame.len());
+            plane.metrics.add_tx(frame.len());
+            plane
+                .metrics
+                .add_transport_tx(send_t.kind().as_str(), frame.len());
         }
         Err(e) => warn!(err = %e, "transport send error"),
+    }
+}
+
+/// Apply congestion pacing before a data send. With N parallel streams each
+/// paces at N× the aggregate interval so the combined rate matches the target.
+async fn pace(plane: &Plane) {
+    if let Some(c) = &plane.cong {
+        let ns = c.pacing_nanos.load(Ordering::Relaxed);
+        if ns > 0 {
+            let per = ns.saturating_mul(plane.params.tunnel_count.max(1) as u64);
+            tokio::time::sleep(Duration::from_nanos(per)).await;
+        }
+    }
+}
+
+/// Consume a peer STATS report: feed the congestion controller and update the
+/// pacing rate + loss/RTT metrics.
+fn handle_control(plane: &Plane, body: &[u8]) {
+    let Some((peer_rx, peer_ts, echo)) = decode_stats(body) else {
+        return;
+    };
+    let Some(c) = &plane.cong else {
+        return;
+    };
+    c.last_peer_ts.store(peer_ts, Ordering::Relaxed);
+
+    let now = unix_millis();
+    let rtt = if echo != 0 && now >= echo {
+        Duration::from_millis(now - echo)
+    } else {
+        Duration::ZERO
+    };
+    let sent = c.tx_data.load(Ordering::Relaxed);
+
+    let (sent_delta, recv_delta) = {
+        let mut fb = c.fb.lock();
+        let sd = sent.saturating_sub(fb.prev_sent);
+        let rd = peer_rx.saturating_sub(fb.prev_recv);
+        fb.prev_sent = sent;
+        fb.prev_recv = peer_rx;
+        (sd, rd)
+    };
+    if sent_delta == 0 {
+        return;
+    }
+    let lost = sent_delta.saturating_sub(recv_delta);
+    let eff_rtt = if rtt.is_zero() {
+        Duration::from_millis(50)
+    } else {
+        rtt
+    };
+    let pacing = {
+        let mut ctl = c.ctl.lock();
+        ctl.on_feedback(recv_delta, lost, eff_rtt, c.mss);
+        ctl.pacing_interval(c.mss)
+    };
+    c.pacing_nanos
+        .store(pacing.as_nanos() as u64, Ordering::Relaxed);
+    plane
+        .metrics
+        .set_loss_ppm(lost.saturating_mul(1_000_000) / sent_delta);
+    if !rtt.is_zero() {
+        plane.metrics.set_rtt_us(rtt.as_micros() as u64);
     }
 }
 
@@ -735,50 +952,32 @@ async fn emit_with_jitter(
 async fn tun_to_net(
     tun: Arc<TunDevice>,
     send_t: Arc<dyn Transport>,
-    session: Arc<SessionCrypto>,
-    plane: PlaneParams,
-    life: Life,
-    metrics: Metrics,
+    plane: Plane,
+    stream_idx: usize,
 ) {
-    let mut tx_counter: u64 = 0;
-    let mut inbuf = vec![0u8; plane.mtu + 256];
+    let p = plane.params;
+    let mut inbuf = vec![0u8; p.mtu + 256];
     let overhead = HEADER_LEN + crypto::TAG_LEN;
-    let jitter_ms = plane.obfs.timing_jitter_ms;
+    // Stream 0 owns the single-instance duties (keepalive, STATS, cover, dead
+    // peer) so they are not multiplied by the stream count.
+    let is_primary = stream_idx == 0;
     let mut last_tx = unix_millis();
 
-    let mut fec = if plane.fec_enabled {
-        match FecEncoder::new(
-            plane.fec_mode,
-            plane.fec_data_shards,
-            plane.fec_parity_shards,
-            plane.shard_len,
-        ) {
-            Ok(e) => Some(e),
-            Err(e) => {
-                warn!(err = %e, "FEC disabled: encoder init failed");
-                None
-            }
-        }
+    let mut acc = if p.mux_enabled {
+        Some(BatchAccumulator::new(p.mux_max_payload))
     } else {
         None
     };
-
-    let mut acc = if plane.mux_enabled {
-        Some(BatchAccumulator::new(plane.mux_max_payload))
-    } else {
-        None
-    };
-    let mut mux_ticker = tokio::time::interval(plane.mux_flush);
-    let cover_on = plane.obfs.cover_pps > 0;
+    let mut mux_ticker = tokio::time::interval(p.mux_flush);
+    let cover_on = is_primary && p.obfs.cover_pps > 0;
     let cover_interval = if cover_on {
-        Duration::from_nanos(1_000_000_000 / plane.obfs.cover_pps.max(1))
+        Duration::from_nanos(1_000_000_000 / p.obfs.cover_pps.max(1))
     } else {
         Duration::from_secs(3600)
     };
     let mut cover_ticker = tokio::time::interval(cover_interval);
-
-    let ka_poll = if plane.keepalive_secs > 0 {
-        (plane.keepalive_secs / 2).max(1)
+    let ka_poll = if p.keepalive_secs > 0 {
+        (p.keepalive_secs / 2).max(1)
     } else {
         5
     };
@@ -791,54 +990,63 @@ async fn tun_to_net(
                 if n == 0 { continue; }
                 last_tx = unix_millis();
                 if let Some(a) = &mut acc {
-                    if a.would_overflow(n) {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane, &metrics).await;
-                    }
+                    if a.would_overflow(n) { flush_batch(&send_t, &plane, a).await; }
                     let _ = a.push(&inbuf[..n]);
-                    if a.encoded_len() >= plane.mux_max_payload {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane, &metrics).await;
-                    }
+                    if a.encoded_len() >= p.mux_max_payload { flush_batch(&send_t, &plane, a).await; }
                 } else {
-                    let counter = tx_counter;
-                    tx_counter += 1;
-                    let pad = plane.obfs.frame_pad(overhead);
-                    match seal_frame(&session, counter, 0, &inbuf[..n], &pad) {
-                        Ok(frame) => emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms, &metrics).await,
+                    let counter = plane.next_counter();
+                    let pad = p.obfs.frame_pad(overhead);
+                    match seal_frame(&plane.session, counter, 0, &inbuf[..n], &pad) {
+                        Ok(frame) => {
+                            if let Some(c) = &plane.cong { c.tx_data.fetch_add(1, Ordering::Relaxed); }
+                            pace(&plane).await;
+                            emit_with_jitter(&*send_t, &plane, &frame).await;
+                        }
                         Err(e) => warn!(err = %e, "seal failed (rekey needed?)"),
                     }
                 }
             }
             _ = mux_ticker.tick(), if acc.is_some() => {
                 if let Some(a) = &mut acc {
-                    if !a.is_empty() {
-                        flush_batch(&send_t, &session, &mut tx_counter, &mut fec, a, &plane, &metrics).await;
-                    }
+                    if !a.is_empty() { flush_batch(&send_t, &plane, a).await; }
                 }
             }
             _ = cover_ticker.tick(), if cover_on => {
-                let counter = tx_counter;
-                tx_counter += 1;
-                let pad = plane.obfs.frame_pad(overhead);
-                if let Ok(frame) = seal_chaff(&session, counter, &pad) {
-                    emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms, &metrics).await;
+                let counter = plane.next_counter();
+                let pad = p.obfs.frame_pad(overhead);
+                if let Ok(frame) = seal_chaff(&plane.session, counter, &pad) {
+                    emit_with_jitter(&*send_t, &plane, &frame).await;
                     last_tx = unix_millis();
                 }
             }
-            _ = ka_ticker.tick() => {
+            _ = ka_ticker.tick(), if is_primary => {
                 let now = unix_millis();
                 // Dead-peer detection → end the session (triggers reconnect).
-                if plane.dead_secs > 0 && now.saturating_sub(life.last_rx_ms()) >= plane.dead_secs * 1000 {
+                if p.dead_secs > 0 && now.saturating_sub(plane.life.last_rx_ms()) >= p.dead_secs * 1000 {
                     warn!("dead peer detected (no traffic); ending session");
-                    life.end();
+                    plane.life.end();
                     return;
                 }
+                // Congestion STATS report to the peer.
+                if let Some(c) = &plane.cong {
+                    let counter = plane.next_counter();
+                    let body = encode_stats(
+                        c.rx_data.load(Ordering::Relaxed),
+                        now,
+                        c.last_peer_ts.load(Ordering::Relaxed),
+                    );
+                    let nopad = obfs::PadPolicy { min: 0, max: 0, pad_to: 0 };
+                    if let Ok(frame) = seal_typed(&plane.session, FrameType::Control, counter, 0, &body, &nopad) {
+                        emit_with_jitter(&*send_t, &plane, &frame).await;
+                        last_tx = now;
+                    }
+                }
                 // Heartbeat when idle (also keeps NAT mappings warm).
-                if plane.keepalive_secs > 0 && now.saturating_sub(last_tx) >= plane.keepalive_secs * 1000 {
-                    let counter = tx_counter;
-                    tx_counter += 1;
-                    let pad = plane.obfs.frame_pad(overhead);
-                    if let Ok(frame) = seal_typed(&session, FrameType::Keepalive, counter, 0, &[], &pad) {
-                        emit_with_jitter(&*send_t, &mut fec, &frame, jitter_ms, &metrics).await;
+                if p.keepalive_secs > 0 && now.saturating_sub(last_tx) >= p.keepalive_secs * 1000 {
+                    let counter = plane.next_counter();
+                    let pad = p.obfs.frame_pad(overhead);
+                    if let Ok(frame) = seal_typed(&plane.session, FrameType::Keepalive, counter, 0, &[], &pad) {
+                        emit_with_jitter(&*send_t, &plane, &frame).await;
                         last_tx = now;
                     }
                 }
@@ -848,23 +1056,17 @@ async fn tun_to_net(
 }
 
 /// Flush the mux accumulator as one padded, batched Data frame.
-#[allow(clippy::too_many_arguments)]
-async fn flush_batch(
-    send_t: &Arc<dyn Transport>,
-    session: &Arc<SessionCrypto>,
-    tx_counter: &mut u64,
-    fec: &mut Option<FecEncoder>,
-    acc: &mut BatchAccumulator,
-    plane: &PlaneParams,
-    metrics: &Metrics,
-) {
+async fn flush_batch(send_t: &Arc<dyn Transport>, plane: &Plane, acc: &mut BatchAccumulator) {
     let Some(batch) = acc.take() else { return };
-    let counter = *tx_counter;
-    *tx_counter += 1;
-    let pad = plane.obfs.frame_pad(HEADER_LEN + crypto::TAG_LEN);
-    match seal_frame(session, counter, flags::MUX_BATCH, &batch, &pad) {
+    let counter = plane.next_counter();
+    let pad = plane.params.obfs.frame_pad(HEADER_LEN + crypto::TAG_LEN);
+    match seal_frame(&plane.session, counter, flags::MUX_BATCH, &batch, &pad) {
         Ok(frame) => {
-            emit_with_jitter(&**send_t, fec, &frame, plane.obfs.timing_jitter_ms, metrics).await
+            if let Some(c) = &plane.cong {
+                c.tx_data.fetch_add(1, Ordering::Relaxed);
+            }
+            pace(plane).await;
+            emit_with_jitter(&**send_t, plane, &frame).await;
         }
         Err(e) => warn!(err = %e, "seal batch failed"),
     }
@@ -872,23 +1074,13 @@ async fn flush_batch(
 
 /// `net → tun`: FEC reconstruct (optional), decrypt, debatch (if mux), deliver,
 /// plus liveness tracking and auth-gated connection migration.
-#[allow(clippy::too_many_arguments)]
 async fn net_to_tun(
     tun: Arc<TunDevice>,
     recv_t: Arc<dyn Transport>,
     send_t: Arc<dyn Transport>,
-    session: Arc<SessionCrypto>,
-    plane: PlaneParams,
-    life: Life,
-    metrics: Metrics,
+    plane: Plane,
 ) {
-    use crate::crypto::ReplayWindow;
-    let mut replay = ReplayWindow::new(plane.replay_window);
-    let mut dec = if plane.fec_enabled {
-        Some(FecDecoder::new(plane.fec_mode, plane.fec_max_groups))
-    } else {
-        None
-    };
+    let p = plane.params;
     let mut buf = vec![0u8; RECV_CAP];
     let mut cur_peer: Option<std::net::Ipv4Addr> = None;
 
@@ -899,23 +1091,23 @@ async fn net_to_tun(
                 // A fatal transport error (e.g. QUIC connection closed) ends
                 // the session so the manager can reconnect.
                 warn!(err = %e, "transport recv error; ending session");
-                life.end();
+                plane.life.end();
                 return;
             }
         };
         if n == 0 {
             continue;
         }
-        life.mark_rx();
-        metrics.add_rx(n);
+        plane.life.mark_rx();
+        plane.metrics.add_rx(n);
 
-        // FEC stage (if enabled) yields 0+ sealed frames; otherwise the
-        // datagram is the sealed frame.
-        let sealed_frames: Vec<Vec<u8>> = if let Some(d) = &mut dec {
-            match d.push(&buf[..n]) {
+        // FEC stage (shared decoder) yields 0+ sealed frames; otherwise the
+        // datagram is the sealed frame. The mutex is held only for `push`.
+        let sealed_frames: Vec<Vec<u8>> = if let Some(dec) = &plane.fec_dec {
+            match dec.lock().push(&buf[..n]) {
                 Ok(v) => v,
                 Err(_) => {
-                    metrics.drop_frame(drop_reason::DECODE);
+                    plane.metrics.drop_frame(drop_reason::DECODE);
                     continue; // malformed FEC datagram — drop
                 }
             }
@@ -925,16 +1117,16 @@ async fn net_to_tun(
 
         let mut authed = false;
         for frame in sealed_frames {
-            authed |= process_sealed(&tun, &session, &mut replay, &frame, &metrics).await;
+            authed |= process_sealed(&tun, &plane, &frame).await;
         }
 
         // Connection migration: once an authenticated frame arrives from a new
         // source, adopt it as the peer (server side). Never trust the source
         // before authentication.
-        if authed && plane.migration && plane.is_server && send_t.supports_hop() {
+        if authed && p.migration && p.is_server && send_t.supports_hop() {
             if let Some(ip) = src {
                 if cur_peer != Some(ip) {
-                    send_t.set_peer(std::net::SocketAddrV4::new(ip, plane.data_port));
+                    send_t.set_peer(std::net::SocketAddrV4::new(ip, p.data_port));
                     cur_peer = Some(ip);
                     info!(peer = %ip, "connection migrated to new peer source");
                 }
@@ -945,13 +1137,8 @@ async fn net_to_tun(
 
 /// Decode, anti-replay, decrypt, and deliver one sealed frame. Returns `true`
 /// if an authenticated `Data` frame was processed (used to gate migration).
-async fn process_sealed(
-    tun: &TunDevice,
-    session: &SessionCrypto,
-    replay: &mut crate::crypto::ReplayWindow,
-    frame: &[u8],
-    metrics: &Metrics,
-) -> bool {
+async fn process_sealed(tun: &TunDevice, plane: &Plane, frame: &[u8]) -> bool {
+    let metrics = &plane.metrics;
     if frame.len() < HEADER_LEN {
         metrics.drop_frame(drop_reason::DECODE);
         return false;
@@ -965,14 +1152,19 @@ async fn process_sealed(
     };
     match header.ftype {
         FrameType::Data => {
-            if !replay.check_and_update(header.counter) {
+            if !plane.replay.lock().check_and_update(header.counter) {
                 debug!(counter = header.counter, "replay/stale frame dropped");
                 metrics.drop_frame(drop_reason::REPLAY);
                 return false;
             }
             let aad = &frame[..HEADER_LEN];
             let mut body = frame[HEADER_LEN..].to_vec();
-            if session.rx.open(header.counter, aad, &mut body).is_err() {
+            if plane
+                .session
+                .rx
+                .open(header.counter, aad, &mut body)
+                .is_err()
+            {
                 metrics.drop_frame(drop_reason::AEAD);
                 return false; // fail-closed
             }
@@ -988,16 +1180,37 @@ async fn process_sealed(
             } else {
                 &body
             };
+            if let Some(c) = &plane.cong {
+                c.rx_data.fetch_add(1, Ordering::Relaxed);
+            }
             if header.flags & flags::MUX_BATCH != 0 {
                 if let Ok(pkts) = mux::decode_batch(payload) {
-                    for p in pkts {
-                        let _ = tun.send(p).await;
+                    for pk in pkts {
+                        let _ = tun.send(pk).await;
                     }
                 }
             } else {
                 let _ = tun.send(payload).await;
             }
             true
+        }
+        FrameType::Control => {
+            if !plane.replay.lock().check_and_update(header.counter) {
+                return false;
+            }
+            let aad = &frame[..HEADER_LEN];
+            let mut body = frame[HEADER_LEN..].to_vec();
+            if plane
+                .session
+                .rx
+                .open(header.counter, aad, &mut body)
+                .is_err()
+            {
+                metrics.drop_frame(drop_reason::AEAD);
+                return false; // fail-closed
+            }
+            handle_control(plane, &body);
+            false
         }
         FrameType::Keepalive => {
             // Liveness only (the arrival already refreshed last_rx in the

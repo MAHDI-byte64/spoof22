@@ -118,6 +118,27 @@ pub fn plan(cfg: &Config, hw: HwInfo) -> ResolvedPlan {
     }
 }
 
+/// Pin the calling thread to `core` (modulo the online CPU count). Best effort:
+/// a failure is ignored (returns without error). Used for NUMA-aware / cache-
+/// friendly placement of the runtime workers at high throughput.
+pub fn pin_current_thread(core: usize) {
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if ncpu == 0 {
+        return;
+    }
+    let target = core % ncpu;
+    // SAFETY: cpu_set_t is zero-initialized then populated via libc helpers;
+    // sched_setaffinity on pid 0 affects the calling thread.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(target, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 fn read_mem_total_mib() -> Option<u64> {
     let text = fs::read_to_string("/proc/meminfo").ok()?;
     for line in text.lines() {

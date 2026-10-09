@@ -34,10 +34,19 @@ pub fn bootstrap(cfg: Config) -> Result<()> {
     let hw = HwInfo::detect(&cfg.transport.interface);
     let plan = tune::plan(&cfg, hw);
 
+    let pin = cfg.perf.cpu_pinning;
+    let pin_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(plan.worker_threads.max(1))
         .enable_all()
         .thread_name("freespoof-worker")
+        .on_thread_start(move || {
+            // NUMA-aware / cache-friendly placement: pin each worker to a core.
+            if pin {
+                let core = pin_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tune::pin_current_thread(core);
+            }
+        })
         .build()
         .map_err(Error::from)?;
 
