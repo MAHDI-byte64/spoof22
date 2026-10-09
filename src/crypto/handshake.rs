@@ -16,6 +16,7 @@
 //! messages that the session layer ships over whatever transport is active.
 
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::config::{AeadKind, PqLevel};
 use crate::crypto::keyschedule::{self, DirectionalKeys, SEED_LEN};
@@ -111,7 +112,8 @@ struct Msg1 {
     version: u8,
     pq: bool,
     level: PqLevel,
-    seed_i: [u8; SEED_LEN],
+    /// Wiped on drop: feeds the session-key KDF, so as sensitive as the keys.
+    seed_i: Zeroizing<[u8; SEED_LEN]>,
     ek: Vec<u8>,
 }
 
@@ -125,7 +127,7 @@ fn decode_msg1(buf: &[u8]) -> Result<Msg1> {
     let version = r.u8()?;
     let flags = r.u8()?;
     let level = pq_level_from_code(r.u8()?)?;
-    let mut seed_i = [0u8; SEED_LEN];
+    let mut seed_i = Zeroizing::new([0u8; SEED_LEN]);
     seed_i.copy_from_slice(r.take(SEED_LEN)?);
     let ek_len = r.u16()? as usize;
     let ek = r.take(ek_len)?.to_vec();
@@ -150,14 +152,15 @@ fn encode_msg2(version: u8, seed_r: &[u8; SEED_LEN], ct: &[u8]) -> Vec<u8> {
 
 struct Msg2 {
     version: u8,
-    seed_r: [u8; SEED_LEN],
+    /// Wiped on drop: feeds the session-key KDF, so as sensitive as the keys.
+    seed_r: Zeroizing<[u8; SEED_LEN]>,
     ct: Vec<u8>,
 }
 
 fn decode_msg2(buf: &[u8]) -> Result<Msg2> {
     let mut r = Reader::new(buf);
     let version = r.u8()?;
-    let mut seed_r = [0u8; SEED_LEN];
+    let mut seed_r = Zeroizing::new([0u8; SEED_LEN]);
     seed_r.copy_from_slice(r.take(SEED_LEN)?);
     let ct_len = r.u16()? as usize;
     let ct = r.take(ct_len)?.to_vec();
@@ -224,7 +227,8 @@ impl<'a> Reader<'a> {
 pub struct Initiator {
     state: snow::HandshakeState,
     params: HandshakeParams,
-    seed_i: [u8; SEED_LEN],
+    /// Wiped on drop (feeds the session-key KDF).
+    seed_i: Zeroizing<[u8; SEED_LEN]>,
     dk: Option<PqDecapKey>,
     pq_offered: bool,
 }
@@ -249,8 +253,8 @@ impl Initiator {
             .map_err(|e| Error::handshake(format!("build init: {e}")))?;
 
         // Contribute a seed and (optionally) an ephemeral ML-KEM keypair.
-        let mut seed_i = [0u8; SEED_LEN];
-        getrandom::getrandom(&mut seed_i).map_err(|e| Error::handshake(format!("rng: {e}")))?;
+        let mut seed_i = Zeroizing::new([0u8; SEED_LEN]);
+        getrandom::getrandom(&mut seed_i[..]).map_err(|e| Error::handshake(format!("rng: {e}")))?;
         let (dk, ek) = if params.pq_hybrid {
             let (dk, ek) = pq::generate(params.pq_level);
             (Some(dk), ek)
@@ -398,8 +402,8 @@ impl Responder {
             (Vec::new(), None)
         };
 
-        let mut seed_r = [0u8; SEED_LEN];
-        getrandom::getrandom(&mut seed_r).map_err(|e| Error::handshake(format!("rng: {e}")))?;
+        let mut seed_r = Zeroizing::new([0u8; SEED_LEN]);
+        getrandom::getrandom(&mut seed_r[..]).map_err(|e| Error::handshake(format!("rng: {e}")))?;
 
         let payload = encode_msg2(self.params.local_version, &seed_r, &ct);
         let mut msg2 = vec![0u8; NOISE_BUF + payload.len()];

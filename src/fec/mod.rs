@@ -259,6 +259,19 @@ impl FecDecoder {
         }
 
         let group = self.group_entry(h.group_id, data_shards, parity_shards, shard_len);
+
+        // The group's geometry is pinned at creation. A later datagram reusing
+        // the same group_id with DIFFERENT dims must be rejected: its index was
+        // bounds-checked against its own (attacker-chosen) total above, not
+        // against this group's vectors, so trusting it would index out of
+        // bounds. Dropping the inconsistent shard also prevents reconstruction
+        // from being poisoned with mismatched geometry.
+        if group.data_shards != data_shards
+            || group.parity_shards != parity_shards
+            || group.shard_len != shard_len
+        {
+            return Err(Error::decode("fec: group geometry mismatch"));
+        }
         let idx = h.index as usize;
         let mut out = Vec::new();
 
@@ -433,5 +446,37 @@ mod tests {
     fn rejects_bad_header() {
         let mut dec = FecDecoder::new(FecMode::Xor, 4);
         assert!(dec.push(&[0u8; 4]).is_err());
+    }
+
+    /// Craft a raw FEC datagram with an explicit (possibly malicious) header.
+    fn raw_dg(gid: u32, index: u8, data: u8, parity: u8, shard_len: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&gid.to_be_bytes());
+        v.push(index);
+        v.push(data);
+        v.push(parity);
+        v.extend_from_slice(&shard_len.to_be_bytes());
+        v.push(0); // mode byte (ignored by the decoder)
+        v.extend_from_slice(&vec![0u8; shard_len as usize]);
+        v
+    }
+
+    /// Regression: a second datagram reusing a live group_id but redeclaring a
+    /// larger geometry and a large index must be rejected, not indexed into the
+    /// smaller shard vector (which previously panicked out of bounds — a remote
+    /// DoS reachable with two crafted, unauthenticated datagrams).
+    #[test]
+    fn rejects_group_geometry_change() {
+        let mut dec = FecDecoder::new(FecMode::Xor, 8);
+        // First datagram pins the group to 2 data + 1 parity (3 shard slots);
+        // index 2 is a parity shard, so no sealed-frame extraction is attempted.
+        let a = raw_dg(7, 2, 2, 1, 4);
+        let _ = dec.push(&a); // group created
+                              // Same id, far larger geometry, index 240: must be a decode error.
+        let b = raw_dg(7, 240, 200, 50, 4);
+        assert!(
+            dec.push(&b).is_err(),
+            "geometry-changing shard must be rejected, not indexed OOB"
+        );
     }
 }

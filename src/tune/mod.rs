@@ -128,9 +128,18 @@ pub fn pin_current_thread(core: usize) {
     if ncpu == 0 {
         return;
     }
-    let target = core % ncpu;
+    // `cpu_set_t` holds a fixed CPU_SETSIZE (1024) bits; CPU_SET indexes its
+    // backing array, so an index >= CPU_SETSIZE panics. On hosts with more than
+    // 1024 logical CPUs, bound the target into range (pinning to one of the
+    // first 1024 cores) rather than indexing out of bounds.
+    let cap = ncpu.min(libc::CPU_SETSIZE as usize);
+    if cap == 0 {
+        return;
+    }
+    let target = core % cap;
     // SAFETY: cpu_set_t is zero-initialized then populated via libc helpers;
-    // sched_setaffinity on pid 0 affects the calling thread.
+    // `target < CPU_SETSIZE` so CPU_SET stays in bounds; sched_setaffinity on
+    // pid 0 affects the calling thread.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);

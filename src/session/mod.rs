@@ -1106,7 +1106,6 @@ async fn net_to_tun(
         if n == 0 {
             continue;
         }
-        plane.life.mark_rx();
         plane.metrics.add_rx(n);
 
         // FEC stage (shared decoder) yields 0+ sealed frames; otherwise the
@@ -1123,15 +1122,30 @@ async fn net_to_tun(
             vec![buf[..n].to_vec()]
         };
 
-        let mut authed = false;
+        let mut authed_data = false;
+        let mut any_auth = false;
         for frame in sealed_frames {
-            authed |= process_sealed(&tun, &plane, &frame).await;
+            match process_sealed(&tun, &plane, &frame).await {
+                Processed::Data => {
+                    any_auth = true;
+                    authed_data = true;
+                }
+                Processed::Authenticated => any_auth = true,
+                Processed::Dropped => {}
+            }
         }
 
-        // Connection migration: once an authenticated frame arrives from a new
-        // source, adopt it as the peer (server side). Never trust the source
-        // before authentication.
-        if authed && p.migration && p.is_server && send_t.supports_hop() {
+        // Refresh liveness ONLY on cryptographically authenticated traffic, so
+        // that forged / stray garbage datagrams cannot defeat dead-peer
+        // detection and keep a wedged session alive (see net_to_tun docs).
+        if any_auth {
+            plane.life.mark_rx();
+        }
+
+        // Connection migration: once an authenticated Data frame arrives from a
+        // new source, adopt it as the peer (server side). Never trust the
+        // source before authentication.
+        if authed_data && p.migration && p.is_server && send_t.supports_hop() {
             if let Some(ip) = src {
                 if cur_peer != Some(ip) {
                     send_t.set_peer(std::net::SocketAddrV4::new(ip, p.data_port));
@@ -1143,28 +1157,41 @@ async fn net_to_tun(
     }
 }
 
-/// Decode, anti-replay, decrypt, and deliver one sealed frame. Returns `true`
-/// if an authenticated `Data` frame was processed (used to gate migration).
-async fn process_sealed(tun: &TunDevice, plane: &Plane, frame: &[u8]) -> bool {
+/// Outcome of processing one sealed frame, used by the caller to refresh
+/// liveness (any authenticated frame) and to gate connection migration (an
+/// authenticated `Data` frame only).
+enum Processed {
+    /// Failed decode / AEAD / replay — unauthenticated, ignore for liveness.
+    Dropped,
+    /// Authenticated non-data frame (control / keepalive) — refreshes liveness.
+    Authenticated,
+    /// Authenticated data frame — refreshes liveness and may gate migration.
+    Data,
+}
+
+/// Decode, decrypt, anti-replay, and deliver one sealed frame.
+///
+/// Security ordering (WireGuard discipline): the frame is AEAD-verified
+/// *before* the replay window is touched, so a forged frame carrying an
+/// attacker-chosen counter can never advance the window or flip its bits. The
+/// cleartext header counter is the AEAD nonce and is bound as AAD, so a frame
+/// that opens successfully provably used that counter; only then is it offered
+/// to the replay filter (which rejects genuine replays of a valid frame).
+async fn process_sealed(tun: &TunDevice, plane: &Plane, frame: &[u8]) -> Processed {
     let metrics = &plane.metrics;
     if frame.len() < HEADER_LEN {
         metrics.drop_frame(drop_reason::DECODE);
-        return false;
+        return Processed::Dropped;
     }
     let (header, _) = match Header::decode(frame) {
         Ok(x) => x,
         Err(_) => {
             metrics.drop_frame(drop_reason::DECODE);
-            return false; // malformed — drop silently
+            return Processed::Dropped; // malformed — drop silently
         }
     };
     match header.ftype {
         FrameType::Data => {
-            if !plane.replay.lock().check_and_update(header.counter) {
-                debug!(counter = header.counter, "replay/stale frame dropped");
-                metrics.drop_frame(drop_reason::REPLAY);
-                return false;
-            }
             let aad = &frame[..HEADER_LEN];
             let mut body = frame[HEADER_LEN..].to_vec();
             if plane
@@ -1174,7 +1201,13 @@ async fn process_sealed(tun: &TunDevice, plane: &Plane, frame: &[u8]) -> bool {
                 .is_err()
             {
                 metrics.drop_frame(drop_reason::AEAD);
-                return false; // fail-closed
+                return Processed::Dropped; // fail-closed — never touch replay
+            }
+            // Authenticated: now it is safe to commit the counter.
+            if !plane.replay.lock().check_and_update(header.counter) {
+                debug!(counter = header.counter, "replay/stale frame dropped");
+                metrics.drop_frame(drop_reason::REPLAY);
+                return Processed::Dropped;
             }
             // Strip padding if present, then (if batched) split.
             let payload: &[u8] = if header.flags & flags::PADDED != 0 {
@@ -1182,7 +1215,7 @@ async fn process_sealed(tun: &TunDevice, plane: &Plane, frame: &[u8]) -> bool {
                     Some(p) => p,
                     None => {
                         metrics.drop_frame(drop_reason::DECODE);
-                        return false; // malformed padding trailer — drop
+                        return Processed::Dropped; // malformed padding — drop
                     }
                 }
             } else {
@@ -1200,12 +1233,9 @@ async fn process_sealed(tun: &TunDevice, plane: &Plane, frame: &[u8]) -> bool {
             } else {
                 let _ = tun.send(payload).await;
             }
-            true
+            Processed::Data
         }
         FrameType::Control => {
-            if !plane.replay.lock().check_and_update(header.counter) {
-                return false;
-            }
             let aad = &frame[..HEADER_LEN];
             let mut body = frame[HEADER_LEN..].to_vec();
             if plane
@@ -1215,19 +1245,40 @@ async fn process_sealed(tun: &TunDevice, plane: &Plane, frame: &[u8]) -> bool {
                 .is_err()
             {
                 metrics.drop_frame(drop_reason::AEAD);
-                return false; // fail-closed
+                return Processed::Dropped; // fail-closed — never touch replay
+            }
+            if !plane.replay.lock().check_and_update(header.counter) {
+                metrics.drop_frame(drop_reason::REPLAY);
+                return Processed::Dropped;
             }
             handle_control(plane, &body);
-            false
+            Processed::Authenticated
         }
         FrameType::Keepalive => {
-            // Liveness only (the arrival already refreshed last_rx in the
-            // caller). Migration conservatively requires a decrypted Data frame.
+            // Keepalives are sealed too: authenticate and replay-check them
+            // before they are allowed to count as liveness, so a forged
+            // keepalive cannot hold a dead session "alive".
+            let aad = &frame[..HEADER_LEN];
+            let mut body = frame[HEADER_LEN..].to_vec();
+            if plane
+                .session
+                .rx
+                .open(header.counter, aad, &mut body)
+                .is_err()
+            {
+                metrics.drop_frame(drop_reason::AEAD);
+                return Processed::Dropped;
+            }
+            if !plane.replay.lock().check_and_update(header.counter) {
+                metrics.drop_frame(drop_reason::REPLAY);
+                return Processed::Dropped;
+            }
             debug!("keepalive received");
-            false
+            Processed::Authenticated
         }
-        // Chaff/cover frames decrypt to nothing meaningful — drop silently.
-        _ => false,
+        // Chaff/cover frames decrypt to nothing meaningful and are not
+        // authenticated here — drop silently and never refresh liveness.
+        _ => Processed::Dropped,
     }
 }
 
