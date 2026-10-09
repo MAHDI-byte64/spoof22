@@ -1,0 +1,68 @@
+# قالبِ یونیتِ systemd برای freespoof — هر instance یک فایلِ کانفیگِ جداگانه دارد.
+#
+# نامِ instance (‏%i) برابرِ basename فایلِ کانفیگ است:
+#   systemctl enable --now freespoof@server   →   /etc/freespoof/server.toml
+#   systemctl enable --now freespoof@client   →   /etc/freespoof/client.toml
+#
+# نصب:
+#   sudo cp systemd/freespoof@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now freespoof@server
+
+[Unit]
+Description=freespoof tunnel instance %i (تونل ضدسانسورِ دوطرفه با جعلِ IP)
+Documentation=file:///opt/freespoof/README.md
+# به شبکه‌ی آماده نیاز داریم (سوکتِ خام روی اینترفیسِ فیزیکی).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# کاربرِ غیرمجازِ اختصاصی؛ قابلیت‌های لازم از طریقِ AmbientCapabilities داده می‌شوند،
+# بنابراین نیازی به اجرا با root نیست.
+User=freespoof
+Group=freespoof
+
+# freespoof به سوکتِ خام (raw socket)، دستگاهِ TUN و تنظیمِ فایروال/sysctl نیاز دارد؛
+# این دو قابلیت دقیقاً همان چیزی است که لازم است و بیشتر از آن داده نمی‌شود.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# قابلیت‌ها باید حفظ شوند؛ پس NoNewPrivileges نباید روشن باشد (در غیرِ این صورت
+# AmbientCapabilities بی‌اثر می‌شود و سوکتِ خام/TUN کار نمی‌کند).
+NoNewPrivileges=false
+
+# دایرکتوریِ کار/نصب.
+WorkingDirectory=/opt/freespoof
+
+ExecStart=/usr/local/bin/freespoof --config /etc/freespoof/%i.toml
+
+# SIGHUP → بازخوانیِ کانفیگ (در نشستِ بعدی اعمال می‌شود؛ بدونِ نیاز به restart).
+ExecReload=/bin/kill -HUP $MAINPID
+
+# خاموش‌سازیِ تمیز: SIGTERM باعث drain شدنِ تونل و بازگرداندنِ sysctl/NAT می‌شود.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# راه‌اندازیِ مجدد در صورتِ خطا.
+Restart=on-failure
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ---- سخت‌سازی‌هایی که سوکتِ خام/TUN/فایروال را نمی‌شکنند ----
+# کلِ سیستمِ فایل فقط-خواندنی می‌شود، جز مسیرهای زیر که باید نوشتنی بمانند:
+#   /etc/freespoof → خواندنِ کانفیگ و گواهیِ QUIC، /run → سوکتِ کنترل.
+ProtectSystem=strict
+ReadWritePaths=/etc/freespoof /run
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectControlGroups=true
+# توجه: ProtectKernelTunables / ProtectKernelModules / PrivateDevices را روشن
+# نمی‌کنیم، چون freespoof باید sysctlها (rp_filter، ip_forward، ...) را تنظیم کند و
+# به /dev/net/tun دسترسی داشته باشد.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+# freespoof — docker-compose deployment.
+#
+# network_mode: host is REQUIRED: freespoof crafts raw IPv4 packets on the real
+# physical interface (forged source) and creates a TUN device; a bridged
+# container network would hide the real NIC and break spoofing. The two
+# capabilities and /dev/net/tun are the minimum needed (no full privileged).
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Put server.toml / client.toml in ./config (mounted at /etc/freespoof).
+
+services:
+  freespoof:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: freespoof:latest
+    container_name: freespoof
+    # Raw sockets on the host NIC require the host network namespace.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN   # TUN device, routing, iptables/nft, rp_filter
+      - NET_RAW     # raw IPv4 sockets with forged source
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # Spoofed-source inbound packets require reverse-path filtering off; the
+    # engine also sets this itself, but declaring it here is explicit.
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "0"
+    volumes:
+      - ./config:/etc/freespoof:ro
+    # Pick the role's config file (server.toml or client.toml).
+    command: ["--config", "/etc/freespoof/server.toml"]
+    restart: unless-stopped
