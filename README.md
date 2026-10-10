@@ -229,6 +229,54 @@ sudo freespoof-manager
 
 <div dir="rtl">
 
+### نصب در شبکه‌ی محدود (ایران)
+
+اگر هنگامِ بیلد خطای `failed to download ... crates-io` گرفتید، یعنی `cargo` از ایران به
+**crates.io** دسترسی ندارد (سمتِ کد مشکلی نیست). سه راه:
+
+**۱) ساده‌ترین و مطمئن‌ترین — بیلد روی سرورِ خارج، کپیِ باینری به ایران.** باینریِ freespoof
+برای هر دو سمت یکسان است (کلاینت/سرور با فلگ تعیین می‌شود). روی سرورِ خارج که نصب شده:
+
+</div>
+
+```bash
+# روی سرورِ خارج: باینری‌ها را بردارید
+scp /usr/local/bin/freespoof /usr/local/bin/freespoof-client /usr/local/bin/freespoof-server  user@iran-box:/tmp/fs/
+```
+
+<div dir="rtl">
+
+سپس روی ماشینِ ایران، نصب‌کننده را در حالتِ «باینریِ آماده» اجرا کنید (بدون بیلد، بدون
+نیاز به crates.io):
+
+</div>
+
+```bash
+curl -fsSL -H "Authorization: Bearer $TOKEN" \
+  https://raw.githubusercontent.com/MAHDI-byte64/spoof22/claude/affectionate-meitner-fsbvda/scripts/install.sh \
+  | sudo FREESPOOF_TOKEN="$TOKEN" FREESPOOF_PREBUILT_DIR=/tmp/fs bash
+```
+
+<div dir="rtl">
+
+**۲) آینه‌ی crates.io.** اگر یک آینه‌ی قابل‌دسترس دارید، آن را بدهید تا بیلد روی ایران هم کار کند
+(مقدار یک sparse index است؛ آینه‌ای که در شبکه‌ی شما باز است را جایگزین کنید):
+
+</div>
+
+```bash
+curl -fsSL -H "Authorization: Bearer $TOKEN" \
+  https://raw.githubusercontent.com/MAHDI-byte64/spoof22/claude/affectionate-meitner-fsbvda/scripts/install.sh \
+  | sudo FREESPOOF_TOKEN="$TOKEN" \
+         FREESPOOF_CARGO_MIRROR="sparse+https://<آینه>/index/" \
+         FREESPOOF_RUSTUP_MIRROR="https://<آینه>" bash
+```
+
+<div dir="rtl">
+
+**۳) بیلد از پشتِ همین تونل.** اگر یک تونلِ دیگر/پراکسی موقت دارید، `cargo` را از پشتِ آن اجرا
+کنید (مثلاً `https_proxy=...`) و سپس `make install`.
+
 ### نصبِ دستی
 
 نیازمندِ **Linux** و قابلیت‌های `CAP_NET_RAW` + `CAP_NET_ADMIN` (برای سوکتِ خام، TUN و

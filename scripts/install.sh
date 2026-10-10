@@ -29,6 +29,10 @@ REPO="${FREESPOOF_REPO:-MAHDI-byte64/spoof22}"
 # Empty = clone the repository's default branch (works regardless of its name).
 REF="${FREESPOOF_REF:-}"
 PREFIX="${FREESPOOF_PREFIX:-/usr/local/bin}"
+# If set to a directory containing prebuilt freespoof binaries, the installer
+# skips cloning/building and installs those (for restricted networks where
+# crates.io is unreachable — build on a clean host and copy the binaries over).
+PREBUILT_DIR="${FREESPOOF_PREBUILT_DIR:-}"
 SRC_DIR="/opt/freespoof/src"
 CONFIG_DIR="/etc/freespoof"
 UNIT_DST="/etc/systemd/system/freespoof@.service"
@@ -121,6 +125,12 @@ cargo_new_enough() {
 }
 
 ensure_cargo() {
+  # آینه‌ی rustup برای شبکه‌های محدود (در صورت تنظیمِ FREESPOOF_RUSTUP_MIRROR).
+  if [[ -n "${FREESPOOF_RUSTUP_MIRROR:-}" ]]; then
+    export RUSTUP_DIST_SERVER="${FREESPOOF_RUSTUP_MIRROR}"
+    export RUSTUP_UPDATE_ROOT="${FREESPOOF_RUSTUP_MIRROR}/rustup"
+    info "آینه‌ی rustup تنظیم شد: ${FREESPOOF_RUSTUP_MIRROR}"
+  fi
   # قبول کن اگر cargoی موجود به‌اندازه‌ی کافی جدید است.
   if cargo_new_enough; then return 0; fi
   # شاید rustup نصب است اما در PATH نیست.
@@ -171,8 +181,34 @@ fetch_source() {
   fi
 }
 
+# در شبکه‌های محدود (ایران)، اگر FREESPOOF_CARGO_MIRROR تنظیم شود، crates.io را با
+# یک آینه‌ی قابل‌دسترس جایگزین می‌کنیم. مقدار باید یک sparse index باشد، مثلاً:
+#   FREESPOOF_CARGO_MIRROR="sparse+https://mirror.example/index/"
+apply_cargo_mirror() {
+  [[ -n "${FREESPOOF_CARGO_MIRROR:-}" ]] || return 0
+  local cfg="$SRC_DIR/.cargo/config.toml"
+  install -d "$SRC_DIR/.cargo"
+  # به‌صورتِ build-local به کانفیگِ مخزن افزوده می‌شود (stanzaهای [target.*]
+  # موجود دست‌نخورده می‌مانند).
+  cat >> "$cfg" <<EOF
+
+# افزوده‌ی نصب‌کننده: آینه‌ی crates.io برای شبکه‌های محدود.
+[source.crates-io]
+replace-with = "freespoof-mirror"
+[source.freespoof-mirror]
+registry = "${FREESPOOF_CARGO_MIRROR}"
+EOF
+  export CARGO_NET_GIT_FETCH_WITH_CLI=true
+  info "آینه‌ی crates.io تنظیم شد: ${FREESPOOF_CARGO_MIRROR}"
+}
+
 build_release() {
+  if [[ -n "$PREBUILT_DIR" ]]; then
+    info "حالتِ باینریِ آماده (FREESPOOF_PREBUILT_DIR=${PREBUILT_DIR}) — بیلد انجام نمی‌شود."
+    return 0
+  fi
   title "بیلدِ release"
+  apply_cargo_mirror
   info "در حالِ کامپایل (ممکن است چند دقیقه طول بکشد) ..."
   if [[ "${FREESPOOF_NATIVE:-0}" == "1" ]]; then
     ( cd "$SRC_DIR" && RUSTFLAGS="-C target-cpu=native" cargo build --release )
@@ -184,10 +220,12 @@ build_release() {
 
 # --- نصبِ فایل‌ها ------------------------------------------------------------
 install_binaries() {
-  title "نصبِ باینری‌ها در ${PREFIX}"
+  local src_dir="${PREBUILT_DIR:-$SRC_DIR/target/release}"
+  title "نصبِ باینری‌ها در ${PREFIX} (از ${src_dir})"
   install -d -m 0755 "$PREFIX"
   for b in "${BINARIES[@]}"; do
-    install -m 0755 "$SRC_DIR/target/release/$b" "$PREFIX/$b"
+    [[ -f "$src_dir/$b" ]] || die "باینریِ ${b} در ${src_dir} یافت نشد."
+    install -m 0755 "$src_dir/$b" "$PREFIX/$b"
     ok "${b} نصب شد."
   done
 }
@@ -241,7 +279,11 @@ install_templates() {
 
 install_manager() {
   # یک wrapper که منیجرِ تعاملی را از سورسِ کلون‌شده اجرا می‌کند
-  # (تا REPO_ROOT برای بیلد/یونیت درست باشد).
+  # (تا REPO_ROOT برای بیلد/یونیت درست باشد). اگر سورس در دسترس نبود، رد می‌شود.
+  if [[ ! -f "$SRC_DIR/scripts/freespoof-manager.sh" ]]; then
+    warn "منیجر در سورس پیدا نشد؛ دستورِ freespoof-manager نصب نشد."
+    return 0
+  fi
   cat > "$PREFIX/freespoof-manager" <<EOF
 #!/usr/bin/env bash
 exec bash "${SRC_DIR}/scripts/freespoof-manager.sh" "\$@"
@@ -271,11 +313,19 @@ EOF
 main() {
   require_linux
   require_root "$@"
-  title "نصبِ freespoof  (repo=${REPO}  ref=${REF})"
-  ensure_build_deps
-  ensure_cargo
-  fetch_source
-  build_release
+  title "نصبِ freespoof  (repo=${REPO}  ref=${REF:-default})"
+  if [[ -n "$PREBUILT_DIR" ]]; then
+    # باینریِ آماده: نه به کامپایلر نیاز است نه به cargo؛ فقط git برای واکشیِ
+    # منیجر/یونیت/قالب‌ها. اگر مخزن در دسترس نباشد، این مرحله را رد می‌کنیم و فقط
+    # باینری‌ها نصب می‌شوند (subshell تا die داخلِ fetch_source کلِ اسکریپت را نبندد).
+    ensure_tool git git
+    ( fetch_source ) || warn "واکشیِ سورس ناموفق بود؛ فقط باینری‌ها نصب می‌شوند (منیجر/یونیت/قالب‌ها رد شد)."
+  else
+    ensure_build_deps
+    ensure_cargo
+    fetch_source
+    build_release
+  fi
   install_binaries
   apply_setcap
   ensure_user_and_dirs
