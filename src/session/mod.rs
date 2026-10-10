@@ -669,15 +669,17 @@ async fn client_handshake(
 ) -> Result<SessionCrypto> {
     let mut buf = vec![0u8; RECV_CAP];
     let mut attempts = 0u32;
+    // Build the initiator + msg1 ONCE. A plain timeout re-sends the SAME msg1 so
+    // a genuine reply delayed past the 2s window still matches the live Noise
+    // state (critical on high-RTT / throttled / censored links). The initiator
+    // is rebuilt ONLY after a reply was actually received and rejected: `finish`
+    // consumes the one-shot Noise state and a forged Handshake2 leaves it
+    // unusable, so that single case must restart from a fresh msg1 — which is
+    // exactly what defeats the one-injected-packet handshake DoS.
+    let (mut initiator, msg1) = crypto::Initiator::start(params.clone())?;
+    let mut frame = frame_with(FrameType::Handshake1, &msg1);
     loop {
         attempts += 1;
-        // Build a FRESH initiator (and msg1) each round. `finish` consumes the
-        // one-shot Noise state, and a forged/garbage Handshake2 fed to it
-        // cannot be retried on the same state, so a rejected reply must restart
-        // from a new msg1 rather than wedge the handshake (anti-DoS: a single
-        // injected Handshake2 no longer tears the client down).
-        let (initiator, msg1) = crypto::Initiator::start(params.clone())?;
-        let frame = frame_with(FrameType::Handshake1, &msg1);
         send_t.send_frame(&frame).await?;
 
         match tokio::time::timeout(
@@ -688,19 +690,23 @@ async fn client_handshake(
         {
             Ok(Ok(body)) => match initiator.finish(&body) {
                 Ok(result) => return Ok(SessionCrypto::from_handshake(Role::Client, &result)),
-                // Forged / invalid reply — droppable: try a fresh round.
+                // Forged / invalid reply — droppable. The Noise state is now
+                // spent, so rebuild a fresh initiator + msg1 for the next round.
                 Err(e) if e.is_droppable() => {
                     if attempts >= 15 {
                         return Err(Error::Session(
                             "handshake failed (only invalid replies received)".into(),
                         ));
                     }
-                    debug!(attempts, err = %e, "rejected invalid Handshake2; retrying");
+                    debug!(attempts, err = %e, "rejected invalid Handshake2; new round");
+                    let (ni, nm) = crypto::Initiator::start(params.clone())?;
+                    initiator = ni;
+                    frame = frame_with(FrameType::Handshake1, &nm);
                 }
                 // A genuine fatal error (e.g. server static-key mismatch).
                 Err(e) => return Err(e),
             },
-            // Droppable recv-layer error — retry rather than tear down.
+            // Droppable recv-layer error — retry with the SAME initiator/msg1.
             Ok(Err(e)) if e.is_droppable() => {
                 if attempts >= 15 {
                     return Err(Error::Session("handshake failed (recv errors)".into()));
@@ -708,6 +714,8 @@ async fn client_handshake(
                 debug!(attempts, err = %e, "droppable recv during handshake; retrying");
             }
             Ok(Err(e)) => return Err(e),
+            // Timeout: retransmit the SAME msg1 — keep the live Noise state so a
+            // delayed genuine reply can still complete the handshake.
             Err(_) => {
                 if attempts >= 15 {
                     return Err(Error::Session("handshake timed out (no response)".into()));

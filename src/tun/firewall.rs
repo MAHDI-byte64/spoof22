@@ -106,15 +106,22 @@ impl Firewall {
         for rule in self.route_restore.iter().rev() {
             let _ = run("ip", rule).await;
         }
-        // Restore /etc/resolv.conf (put the original back, or delete ours).
+        // Restore /etc/resolv.conf (put the original back, or clear ours). The
+        // write/remove needs filesystem-write privilege at teardown: it works
+        // when we still run privileged, but the in-process privilege drop
+        // (hardening.run_as_user) removes DAC write to the root-owned file, so
+        // this is best-effort and surfaced on failure rather than silently lost.
         if let Some(orig) = &self.resolv_backup {
-            match orig {
-                Some(bytes) => {
-                    let _ = std::fs::write("/etc/resolv.conf", bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file("/etc/resolv.conf");
-                }
+            let res = match orig {
+                Some(bytes) => std::fs::write("/etc/resolv.conf", bytes),
+                // Prefer unlinking our file; if that is blocked (e.g. Landlock
+                // grants no RemoveFile on /etc) fall back to a neutral
+                // placeholder so tunnel resolvers are never left behind.
+                None => std::fs::remove_file("/etc/resolv.conf")
+                    .or_else(|_| std::fs::write("/etc/resolv.conf", b"# cleared by freespoof\n")),
+            };
+            if let Err(e) = res {
+                warn!(err = %e, "could not restore /etc/resolv.conf (DNS may still point at tunnel resolvers; teardown needs filesystem-write privilege)");
             }
         }
         // Restore sysctls.
@@ -329,14 +336,11 @@ impl Drop for Firewall {
             let _ = std::process::Command::new("ip").args(rule).output();
         }
         if let Some(orig) = &self.resolv_backup {
-            match orig {
-                Some(bytes) => {
-                    let _ = std::fs::write("/etc/resolv.conf", bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file("/etc/resolv.conf");
-                }
-            }
+            let _ = match orig {
+                Some(bytes) => std::fs::write("/etc/resolv.conf", bytes),
+                None => std::fs::remove_file("/etc/resolv.conf")
+                    .or_else(|_| std::fs::write("/etc/resolv.conf", b"# cleared by freespoof\n")),
+            };
         }
         for (k, v) in self.sysctls.iter().rev() {
             let _ = std::process::Command::new("sysctl")
