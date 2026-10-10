@@ -170,8 +170,12 @@ pub fn seccomp_filter(enabled: bool) {
 const LANDLOCK_RO: &[&str] = &[
     "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev",
 ];
-/// Read-write Landlock paths: runtime dirs (control socket, xtables lock, tmp).
-const LANDLOCK_RW: &[&str] = &["/run", "/var", "/tmp"];
+/// Read-write Landlock paths: runtime dirs (control socket, xtables lock, tmp),
+/// plus the two trees the firewall teardown legitimately writes — `/proc/sys`
+/// (restoring rp_filter / ip_forward sysctls) and `/etc/resolv.conf` (DNS
+/// push/restore). A more specific RW rule refines the RO rule on its parent, so
+/// the rest of `/proc` and `/etc` stay read-only.
+const LANDLOCK_RW: &[&str] = &["/run", "/var", "/tmp", "/proc/sys", "/etc/resolv.conf"];
 
 fn install_landlock() -> std::result::Result<landlock::RestrictionStatus, landlock::RulesetError> {
     use landlock::{

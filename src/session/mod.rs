@@ -56,6 +56,10 @@ struct PlaneParams {
     migration: bool,
     data_port: u16,
     is_server: bool,
+    /// Spoofing disabled: the peer's observed source IS its real address, so it
+    /// is safe to adopt on migration. In spoof mode the source is forged, so
+    /// migration-by-source must be disabled (adopting it would black-hole us).
+    no_spoof: bool,
     replay_window: u32,
     /// Number of parallel tunnel streams (from auto-tune or config).
     tunnel_count: usize,
@@ -101,6 +105,7 @@ impl PlaneParams {
             migration: cfg.reliability.enable_migration,
             data_port: cfg.transport.data_port,
             is_server: matches!(cfg.role, Role::Server),
+            no_spoof: cfg.spoof.no_spoof,
             replay_window: cfg.crypto.replay_window,
             tunnel_count,
             cong_enabled,
@@ -662,23 +667,45 @@ async fn client_handshake(
     recv_t: &dyn Transport,
     params: crypto::HandshakeParams,
 ) -> Result<SessionCrypto> {
-    let (initiator, msg1) = crypto::Initiator::start(params)?;
-    let frame = frame_with(FrameType::Handshake1, &msg1);
-
     let mut buf = vec![0u8; RECV_CAP];
     let mut attempts = 0u32;
     loop {
-        send_t.send_frame(&frame).await?;
         attempts += 1;
+        // Build a FRESH initiator (and msg1) each round. `finish` consumes the
+        // one-shot Noise state, and a forged/garbage Handshake2 fed to it
+        // cannot be retried on the same state, so a rejected reply must restart
+        // from a new msg1 rather than wedge the handshake (anti-DoS: a single
+        // injected Handshake2 no longer tears the client down).
+        let (initiator, msg1) = crypto::Initiator::start(params.clone())?;
+        let frame = frame_with(FrameType::Handshake1, &msg1);
+        send_t.send_frame(&frame).await?;
+
         match tokio::time::timeout(
             Duration::from_secs(2),
             wait_for_type(recv_t, &mut buf, FrameType::Handshake2),
         )
         .await
         {
-            Ok(Ok(body)) => {
-                let result = initiator.finish(&body)?;
-                return Ok(SessionCrypto::from_handshake(Role::Client, &result));
+            Ok(Ok(body)) => match initiator.finish(&body) {
+                Ok(result) => return Ok(SessionCrypto::from_handshake(Role::Client, &result)),
+                // Forged / invalid reply — droppable: try a fresh round.
+                Err(e) if e.is_droppable() => {
+                    if attempts >= 15 {
+                        return Err(Error::Session(
+                            "handshake failed (only invalid replies received)".into(),
+                        ));
+                    }
+                    debug!(attempts, err = %e, "rejected invalid Handshake2; retrying");
+                }
+                // A genuine fatal error (e.g. server static-key mismatch).
+                Err(e) => return Err(e),
+            },
+            // Droppable recv-layer error — retry rather than tear down.
+            Ok(Err(e)) if e.is_droppable() => {
+                if attempts >= 15 {
+                    return Err(Error::Session("handshake failed (recv errors)".into()));
+                }
+                debug!(attempts, err = %e, "droppable recv during handshake; retrying");
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -758,15 +785,23 @@ impl HandshakeRateLimiter {
             return true; // disabled
         }
         let window = now_ms / 60_000;
+        // Hard-bound the table against a spoofed-source flood: during a single
+        // window every entry is current-window, so retaining current-window
+        // entries would never shrink it. If we are at the cap and this is a new
+        // source, clear the table (the limiter simply resets) rather than grow
+        // without bound — memory stays bounded under a forged-source flood.
+        const CAP: usize = 10_000;
+        if self.seen.len() >= CAP && !self.seen.contains_key(&ip) {
+            self.seen.retain(|_, (w, _)| *w == window);
+            if self.seen.len() >= CAP {
+                self.seen.clear();
+            }
+        }
         let entry = self.seen.entry(ip).or_insert((window, 0));
         if entry.0 != window {
             *entry = (window, 0);
         }
         entry.1 += 1;
-        // Opportunistically bound the table size.
-        if self.seen.len() > 10_000 {
-            self.seen.retain(|_, (w, _)| *w == window);
-        }
         self.seen
             .get(&ip)
             .map(|(_, c)| *c <= self.max_per_min)
@@ -984,10 +1019,20 @@ async fn tun_to_net(
         Duration::from_secs(3600)
     };
     let mut cover_ticker = tokio::time::interval(cover_interval);
-    let ka_poll = if p.keepalive_secs > 0 {
-        (p.keepalive_secs / 2).max(1)
-    } else {
-        5
+    // Poll often enough for BOTH keepalive emission and dead-peer detection:
+    // a large keepalive interval must not delay a short dead-peer timeout.
+    let ka_poll = {
+        let ka = if p.keepalive_secs > 0 {
+            p.keepalive_secs / 2
+        } else {
+            5
+        };
+        let dp = if p.dead_secs > 0 {
+            p.dead_secs / 2
+        } else {
+            u64::MAX
+        };
+        ka.min(dp).max(1)
     };
     let mut ka_ticker = tokio::time::interval(Duration::from_secs(ka_poll));
 
@@ -1024,7 +1069,10 @@ async fn tun_to_net(
                 let pad = p.obfs.frame_pad(overhead);
                 if let Ok(frame) = seal_chaff(&plane.session, counter, &pad) {
                     emit_with_jitter(&*send_t, &plane, &frame).await;
-                    last_tx = unix_millis();
+                    // NOTE: deliberately do NOT advance last_tx here. Cover/chaff
+                    // frames are not authenticated by the peer (they never refresh
+                    // its liveness), so letting them suppress our keepalives would
+                    // make the peer declare us dead while cover traffic flows.
                 }
             }
             _ = ka_ticker.tick(), if is_primary => {
@@ -1095,9 +1143,16 @@ async fn net_to_tun(
     loop {
         let (n, src) = match recv_t.recv_frame_from(&mut buf).await {
             Ok(x) => x,
+            // A droppable error means one malformed inbound packet (e.g. a short
+            // GRE/ICMP frame an off-path attacker can send to our raw socket) —
+            // skip it, never tear the session down over attacker-chosen input.
+            Err(e) if e.is_droppable() => {
+                plane.metrics.drop_frame(drop_reason::DECODE);
+                continue;
+            }
+            // A genuine fatal transport error (e.g. QUIC connection closed) ends
+            // the session so the manager can reconnect.
             Err(e) => {
-                // A fatal transport error (e.g. QUIC connection closed) ends
-                // the session so the manager can reconnect.
                 warn!(err = %e, "transport recv error; ending session");
                 plane.life.end();
                 return;
@@ -1144,8 +1199,10 @@ async fn net_to_tun(
 
         // Connection migration: once an authenticated Data frame arrives from a
         // new source, adopt it as the peer (server side). Never trust the
-        // source before authentication.
-        if authed_data && p.migration && p.is_server && send_t.supports_hop() {
+        // source before authentication — AND only when spoofing is disabled:
+        // in spoof mode the observed source is the peer's FORGED address, so
+        // adopting it as our send destination would black-hole server->client.
+        if authed_data && p.migration && p.no_spoof && p.is_server && send_t.supports_hop() {
             if let Some(ip) = src {
                 if cur_peer != Some(ip) {
                     send_t.set_peer(std::net::SocketAddrV4::new(ip, p.data_port));

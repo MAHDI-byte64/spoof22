@@ -38,7 +38,12 @@ impl Congestion {
     pub fn on_feedback(&mut self, delivered: u64, lost: u64, rtt: Duration, mss: usize) {
         match self {
             Congestion::Aimd(a) => {
-                for _ in 0..delivered {
+                // `delivered` comes from the peer's STATS report; cap the ack
+                // loop so a bogus/huge value cannot spin here (the congestion
+                // lock is held). The cap is far above any real per-feedback
+                // delivery count, so legitimate throughput is unaffected.
+                let acks = delivered.min(1 << 20);
+                for _ in 0..acks {
                     a.on_ack();
                 }
                 if lost > 0 {

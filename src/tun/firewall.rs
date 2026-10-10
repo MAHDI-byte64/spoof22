@@ -44,6 +44,11 @@ pub struct Firewall {
     nft_table: bool,
     /// (key, original value) sysctls to restore.
     sysctls: Vec<(String, String)>,
+    /// `ip` argument-vectors to run on teardown to restore routing.
+    route_restore: Vec<Vec<String>>,
+    /// Set once we overwrote /etc/resolv.conf: the original bytes to put back,
+    /// or `None` if there was no original file (restore = delete).
+    resolv_backup: Option<Option<Vec<u8>>>,
     torn_down: bool,
 }
 
@@ -57,6 +62,8 @@ impl Firewall {
             iptables_rules: Vec::new(),
             nft_table: false,
             sysctls: Vec::new(),
+            route_restore: Vec::new(),
+            resolv_backup: None,
             torn_down: false,
         };
 
@@ -94,6 +101,21 @@ impl Firewall {
         }
         if self.nft_table {
             let _ = run("nft", &["delete", "table", "ip", "freespoof"]).await;
+        }
+        // Restore routing (default route / split CIDRs).
+        for rule in self.route_restore.iter().rev() {
+            let _ = run("ip", rule).await;
+        }
+        // Restore /etc/resolv.conf (put the original back, or delete ours).
+        if let Some(orig) = &self.resolv_backup {
+            match orig {
+                Some(bytes) => {
+                    let _ = std::fs::write("/etc/resolv.conf", bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file("/etc/resolv.conf");
+                }
+            }
         }
         // Restore sysctls.
         for (k, v) in self.sysctls.iter().rev() {
@@ -194,7 +216,13 @@ impl Firewall {
             .await;
         self.add_iptables(&["OUTPUT", "-o", &iface, "-d", &peer, "-j", "ACCEPT"])
             .await;
-        // Permit loopback + established.
+        // Permit loopback + established. NOTE: the ESTABLISHED,RELATED accept is
+        // a deliberate trade-off — it keeps the operator's own pre-existing
+        // connections (e.g. the SSH session managing this host) from being cut
+        // when the tunnel drops. The cost is that flows already established over
+        // the physical NIC before the tunnel came up can keep egressing in the
+        // clear. Operators who need a strict no-exceptions kill switch should
+        // drop this rule (and accept that it may sever their control channel).
         self.add_iptables(&["OUTPUT", "-o", "lo", "-j", "ACCEPT"])
             .await;
         self.add_iptables(&[
@@ -216,8 +244,23 @@ impl Firewall {
     async fn apply_routing(&mut self, cfg: &Config) -> Result<()> {
         match cfg.tun.routing_mode {
             RoutingMode::Full => {
-                // Full tunnel: route the peer's real IP via the physical gw, and
-                // default via the TUN. (Operators with complex setups override.)
+                // Full tunnel: default via the TUN. Capture the current default
+                // route first so teardown can put it back (otherwise the host is
+                // left with no working default route once the TUN disappears).
+                match ip_default_route().await {
+                    Some(orig) => {
+                        let mut restore = vec!["route".to_string(), "replace".to_string()];
+                        restore.extend(orig.split_whitespace().map(|s| s.to_string()));
+                        self.route_restore.push(restore);
+                    }
+                    None => self.route_restore.push(vec![
+                        "route".to_string(),
+                        "del".to_string(),
+                        "default".to_string(),
+                        "dev".to_string(),
+                        cfg.tun.tun_name.clone(),
+                    ]),
+                }
                 let _ = run(
                     "ip",
                     &["route", "replace", "default", "dev", &cfg.tun.tun_name],
@@ -226,12 +269,23 @@ impl Firewall {
             }
             RoutingMode::Split => {
                 for cidr in &cfg.tun.split_cidrs {
+                    // On teardown, remove the route we added for each CIDR.
+                    self.route_restore.push(vec![
+                        "route".to_string(),
+                        "del".to_string(),
+                        cidr.clone(),
+                        "dev".to_string(),
+                        cfg.tun.tun_name.clone(),
+                    ]);
                     let _ = run("ip", &["route", "replace", cidr, "dev", &cfg.tun.tun_name]).await;
                 }
             }
         }
-        // DNS leak prevention: push configured resolvers (best effort).
+        // DNS leak prevention: push configured resolvers, backing up the
+        // original /etc/resolv.conf so teardown restores it (otherwise the host
+        // is left pointing at tunnel-only resolvers after exit).
         if !cfg.tun.dns_servers.is_empty() {
+            self.resolv_backup = Some(std::fs::read("/etc/resolv.conf").ok());
             push_dns(&cfg.tun.dns_servers);
         }
         Ok(())
@@ -271,6 +325,19 @@ impl Drop for Firewall {
                 .args(["delete", "table", "ip", "freespoof"])
                 .output();
         }
+        for rule in self.route_restore.iter().rev() {
+            let _ = std::process::Command::new("ip").args(rule).output();
+        }
+        if let Some(orig) = &self.resolv_backup {
+            match orig {
+                Some(bytes) => {
+                    let _ = std::fs::write("/etc/resolv.conf", bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file("/etc/resolv.conf");
+                }
+            }
+        }
         for (k, v) in self.sysctls.iter().rev() {
             let _ = std::process::Command::new("sysctl")
                 .args(["-w", &format!("{k}={v}")])
@@ -305,6 +372,24 @@ async fn which(cmd: &str) -> bool {
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// The current IPv4 default route as a single `ip route` spec line (e.g.
+/// "default via 192.168.1.1 dev eth0 ..."), or `None` if there is none.
+async fn ip_default_route() -> Option<String> {
+    let out = Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
 }
 
 async fn get_sysctl(key: &str) -> Option<String> {

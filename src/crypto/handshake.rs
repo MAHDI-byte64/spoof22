@@ -55,6 +55,18 @@ pub struct HandshakeParams {
     pub allowed_peers: Vec<[u8; 32]>,
 }
 
+impl Drop for HandshakeParams {
+    /// Wipe the long-term secret material on drop — including every per-attempt
+    /// clone — so the static private key and PSK do not linger in freed memory.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.local_private.zeroize();
+        if let Some(psk) = &mut self.psk {
+            psk.zeroize();
+        }
+    }
+}
+
 /// The negotiated outcome of a completed handshake.
 pub struct HandshakeResult {
     /// Derived directional data-plane keys (zeroized on drop).
@@ -291,10 +303,14 @@ impl Initiator {
     /// Finish the handshake given the responder's reply.
     pub fn finish(mut self, msg2: &[u8]) -> Result<HandshakeResult> {
         let mut out = vec![0u8; NOISE_BUF.max(msg2.len())];
+        // A MAC failure here means the frame was forged / garbage (an on-path
+        // injector cannot produce a valid Noise msg2). Classify it as a
+        // *droppable* crypto error so the caller keeps waiting for the genuine
+        // reply instead of tearing down the handshake on one injected packet.
         let n = self
             .state
             .read_message(msg2, &mut out)
-            .map_err(|e| Error::handshake(format!("read msg2: {e}")))?;
+            .map_err(|e| Error::crypto(format!("read msg2: {e}")))?;
         out.truncate(n);
         let m2 = decode_msg2(&out)?;
 
@@ -371,10 +387,13 @@ impl Responder {
     /// Process the initiator's first message and produce the reply + result.
     pub fn respond(mut self, msg1: &[u8]) -> Result<(Vec<u8>, HandshakeResult)> {
         let mut out = vec![0u8; NOISE_BUF.max(msg1.len())];
+        // A MAC failure here means the frame was forged / garbage; make it a
+        // *droppable* crypto error so server_handshake drops it and keeps
+        // listening instead of aborting the whole handshake (anti-DoS).
         let n = self
             .state
             .read_message(msg1, &mut out)
-            .map_err(|e| Error::handshake(format!("read msg1: {e}")))?;
+            .map_err(|e| Error::crypto(format!("read msg1: {e}")))?;
         out.truncate(n);
         let m1 = decode_msg1(&out)?;
 
@@ -592,5 +611,50 @@ mod tests {
         let err = responder.respond(&msg1).err().unwrap();
         assert!(matches!(err, Error::VersionMismatch { .. }));
         drop(initiator);
+    }
+
+    fn one_params() -> (HandshakeParams, HandshakeParams) {
+        let (c_priv, c_pub) = keypair();
+        let (s_priv, s_pub) = keypair();
+        let mk = |lp, pp| HandshakeParams {
+            local_private: lp,
+            peer_public: pp,
+            psk: None,
+            pq_hybrid: false,
+            pq_level: PqLevel::MlKem768,
+            aead: AeadKind::Chacha20Poly1305,
+            local_version: 1,
+            allowed_peers: vec![],
+        };
+        (mk(c_priv, s_pub), mk(s_priv, c_pub))
+    }
+
+    /// Regression: a forged/garbage Handshake2 fed to the initiator must yield a
+    /// DROPPABLE error so the client keeps waiting for the genuine reply rather
+    /// than tearing the handshake down on one injected packet (on-path DoS).
+    #[test]
+    fn forged_msg2_is_droppable() {
+        let (cp, _sp) = one_params();
+        let (initiator, _msg1) = Initiator::start(cp).unwrap();
+        let garbage = vec![0u8; 96];
+        let err = initiator.finish(&garbage).err().unwrap();
+        assert!(
+            err.is_droppable(),
+            "forged msg2 must be droppable, got {err:?}"
+        );
+    }
+
+    /// Regression: a forged/garbage Handshake1 fed to the responder must yield a
+    /// DROPPABLE error so server_handshake drops it and keeps listening.
+    #[test]
+    fn forged_msg1_is_droppable() {
+        let (_cp, sp) = one_params();
+        let responder = Responder::start(sp).unwrap();
+        let garbage = vec![0u8; 96];
+        let err = responder.respond(&garbage).err().unwrap();
+        assert!(
+            err.is_droppable(),
+            "forged msg1 must be droppable, got {err:?}"
+        );
     }
 }
