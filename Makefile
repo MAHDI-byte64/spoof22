@@ -5,7 +5,7 @@ CARGO ?= cargo
 NATIVE_RUSTFLAGS := -C target-cpu=native
 
 .PHONY: all build release native test fmt fmt-check clippy check \
-        musl aarch64 docker fuzz bench clean setcap
+        musl aarch64 docker fuzz bench clean setcap install
 
 all: check
 
@@ -60,6 +60,14 @@ bench:
 # Grant the caps so freespoof can run unprivileged.
 setcap:
 	sudo setcap cap_net_raw,cap_net_admin+ep ./target/release/freespoof
+
+# Install locally from this checkout (build + copy to /usr/local/bin + setcap).
+# For remote one-line installs use scripts/install.sh (see README). Needs root.
+install: release
+	install -d /usr/local/bin
+	install -m0755 target/release/freespoof target/release/freespoof-client target/release/freespoof-server /usr/local/bin/
+	command -v setcap >/dev/null 2>&1 && setcap cap_net_raw,cap_net_admin+ep /usr/local/bin/freespoof || true
+	@echo "نصب شد. برای پیکربندی: sudo bash scripts/freespoof-manager.sh"
 
 clean:
 	$(CARGO) clean

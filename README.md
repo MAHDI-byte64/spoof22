@@ -189,6 +189,43 @@
 
 ## نصب
 
+### نصبِ یک‌خطی (توصیه‌شده)
+
+روی **هر طرف** (سرور و کلاینت) این یک خط را اجرا کنید. پیش‌نیازها را نصب، از سورس بیلد،
+باینری‌ها را در `/usr/local/bin` نصب، `setcap` و کاربرِ غیرمجاز و دایرکتوری‌ها و یونیتِ
+systemd را به‌صورتِ خودکار آماده می‌کند:
+
+</div>
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/spoof22/main/scripts/install.sh | sudo bash
+```
+
+<div dir="rtl">
+
+تا پیش از ادغام در شاخه‌ی `main`، از همان شاخه‌ی توسعه نصب کنید:
+
+</div>
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/MAHDI-byte64/spoof22/claude/affectionate-meitner-fsbvda/scripts/install.sh" \
+  | sudo FREESPOOF_REF=claude/affectionate-meitner-fsbvda bash
+```
+
+<div dir="rtl">
+
+سپس پیکربندی و راه‌اندازیِ سرویس را به‌صورتِ تعاملی انجام دهید (در یک ترمینالِ واقعی):
+
+</div>
+
+```bash
+sudo freespoof-manager
+```
+
+<div dir="rtl">
+
+### نصبِ دستی
+
 نیازمندِ **Linux** و قابلیت‌های `CAP_NET_RAW` + `CAP_NET_ADMIN` (برای سوکتِ خام، TUN و
 فایروال). دو راه دارید: یا با `root` اجرا کنید، یا با `setcap` این قابلیت‌ها را به باینری بدهید
 و با کاربرِ عادی اجرا کنید:
