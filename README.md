@@ -193,23 +193,28 @@
 
 روی **هر طرف** (سرور و کلاینت) این یک خط را اجرا کنید. پیش‌نیازها را نصب، از سورس بیلد،
 باینری‌ها را در `/usr/local/bin` نصب، `setcap` و کاربرِ غیرمجاز و دایرکتوری‌ها و یونیتِ
-systemd را به‌صورتِ خودکار آماده می‌کند:
+systemd را به‌صورتِ خودکار آماده می‌کند (نصب‌کننده به‌طورِ پیش‌فرض شاخه‌ی پیش‌فرضِ مخزن را
+کلون می‌کند؛ با `FREESPOOF_REF` می‌توانید شاخه/تگ/کامیتِ دلخواه بدهید):
 
 </div>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/spoof22/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/spoof22/claude/affectionate-meitner-fsbvda/scripts/install.sh | sudo bash
 ```
 
 <div dir="rtl">
 
-تا پیش از ادغام در شاخه‌ی `main`، از همان شاخه‌ی توسعه نصب کنید:
+خطِ بالا وقتی کار می‌کند که مخزن **عمومی (public)** باشد. اگر مخزن **خصوصی** است، هم برای
+دریافتِ خودِ اسکریپت و هم برای کلونِ داخلیِ آن به یک توکنِ GitHub نیاز است (توکن را در لاگ
+چاپ نمی‌کنیم):
 
 </div>
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/MAHDI-byte64/spoof22/claude/affectionate-meitner-fsbvda/scripts/install.sh" \
-  | sudo FREESPOOF_REF=claude/affectionate-meitner-fsbvda bash
+TOKEN=ghp_xxx   # یک GitHub token با دسترسیِ read به مخزن
+curl -fsSL -H "Authorization: Bearer $TOKEN" \
+  https://raw.githubusercontent.com/MAHDI-byte64/spoof22/claude/affectionate-meitner-fsbvda/scripts/install.sh \
+  | sudo FREESPOOF_TOKEN="$TOKEN" bash
 ```
 
 <div dir="rtl">

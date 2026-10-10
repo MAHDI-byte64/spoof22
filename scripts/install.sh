@@ -2,8 +2,10 @@
 #
 # install.sh — نصب‌کننده‌ی یک‌خطیِ freespoof (bootstrapِ غیرتعاملی)
 #
-# استفاده (یک‌خطی):
-#   curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/spoof22/main/scripts/install.sh | sudo bash
+# استفاده (یک‌خطی) — از شاخه‌ی فعلیِ مخزن:
+#   curl -fsSL https://raw.githubusercontent.com/MAHDI-byte64/spoof22/claude/affectionate-meitner-fsbvda/scripts/install.sh | sudo bash
+#
+# FREESPOOF_REF را تنظیم نکنید تا شاخه‌ی پیش‌فرضِ مخزن کلون شود.
 #
 # این اسکریپت مرحله‌ی سیستمی و غیرتعاملی را انجام می‌دهد:
 #   - نصبِ پیش‌نیازها (در صورت نیاز: git، کامپایلر، زنجیره‌ی Rust)
@@ -24,7 +26,8 @@
 set -euo pipefail
 
 REPO="${FREESPOOF_REPO:-MAHDI-byte64/spoof22}"
-REF="${FREESPOOF_REF:-main}"
+# Empty = clone the repository's default branch (works regardless of its name).
+REF="${FREESPOOF_REF:-}"
 PREFIX="${FREESPOOF_PREFIX:-/usr/local/bin}"
 SRC_DIR="/opt/freespoof/src"
 CONFIG_DIR="/etc/freespoof"
@@ -118,20 +121,24 @@ ensure_cargo() {
 
 # --- واکشیِ سورس و بیلد -----------------------------------------------------
 fetch_source() {
+  # For a PRIVATE repo, set FREESPOOF_TOKEN to a GitHub token so the clone can
+  # authenticate; for a public repo it is unnecessary.
+  local url="https://github.com/${REPO}.git"
+  if [[ -n "${FREESPOOF_TOKEN:-}" ]]; then
+    url="https://x-access-token:${FREESPOOF_TOKEN}@github.com/${REPO}.git"
+  fi
   mkdir -p "$(dirname "$SRC_DIR")"
-  if [[ -d "$SRC_DIR/.git" ]]; then
-    info "به‌روزرسانیِ سورسِ موجود در ${SRC_DIR} (ref=${REF}) ..."
-    git -C "$SRC_DIR" fetch --depth 1 origin "$REF" \
-      || die "fetch ناموفق بود (ref=${REF})."
-    git -C "$SRC_DIR" checkout -q FETCH_HEAD
-  else
+  rm -rf "$SRC_DIR" # always fetch a clean, shallow checkout
+  if [[ -n "$REF" ]]; then
     info "کلونِ ${REPO} (ref=${REF}) در ${SRC_DIR} ..."
-    rm -rf "$SRC_DIR"
-    git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$SRC_DIR" 2>/dev/null \
-      || git clone "https://github.com/${REPO}.git" "$SRC_DIR" \
-      || die "کلونِ مخزن ناموفق بود."
-    # اگر ref یک شاخه نبود (تگ/کامیت)، صریحاً checkout کن.
-    git -C "$SRC_DIR" checkout -q "$REF" 2>/dev/null || true
+    if ! git clone --depth 1 --branch "$REF" "$url" "$SRC_DIR" 2>/dev/null; then
+      # ref may be a tag/commit, not a branch: full clone then checkout.
+      git clone "$url" "$SRC_DIR" || die "کلونِ مخزن ناموفق بود."
+      git -C "$SRC_DIR" checkout -q "$REF" || die "checkoutِ ref=${REF} ناموفق بود."
+    fi
+  else
+    info "کلونِ ${REPO} (شاخه‌ی پیش‌فرض) در ${SRC_DIR} ..."
+    git clone --depth 1 "$url" "$SRC_DIR" || die "کلونِ مخزن ناموفق بود."
   fi
 }
 
