@@ -1,6 +1,7 @@
 [toolchain]
-# freespoof targets stable Rust. 1.75 is the documented minimum; CI pins a
-# recent stable. `rustfmt` and `clippy` are required for the quality gates.
+# freespoof targets stable Rust. The dependency tree requires rustc >= 1.89
+# (edition2024 + newer deps such as aes 0.9), so build with a recent stable.
+# `rustfmt` and `clippy` are required for the quality gates.
 channel = "stable"
 components = ["rustfmt", "clippy"]
 targets = [

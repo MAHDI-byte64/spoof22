@@ -104,19 +104,48 @@ ensure_build_deps() {
   fi
 }
 
+# حداقل نسخه‌ی rustc/cargo که درختِ وابستگی‌ها لازم دارد (edition2024 + aes 0.9).
+MIN_RUST_MAJOR=1
+MIN_RUST_MINOR=89
+
+# آیا cargoی فعلی به‌اندازه‌ی کافی جدید است؟ (مقایسه‌ی major.minor)
+cargo_new_enough() {
+  have cargo || return 1
+  local v; v="$(cargo --version 2>/dev/null | awk '{print $2}')" || return 1
+  local maj=${v%%.*} rest=${v#*.} min
+  min=${rest%%.*}
+  [[ -n "$maj" && -n "$min" ]] || return 1
+  (( maj > MIN_RUST_MAJOR )) && return 0
+  (( maj == MIN_RUST_MAJOR && min >= MIN_RUST_MINOR )) && return 0
+  return 1
+}
+
 ensure_cargo() {
-  if have cargo; then return 0; fi
-  # اگر قبلاً rustup نصب شده اما در PATH نیست:
-  if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
-    export PATH="$HOME/.cargo/bin:$PATH"; return 0
+  # قبول کن اگر cargoی موجود به‌اندازه‌ی کافی جدید است.
+  if cargo_new_enough; then return 0; fi
+  # شاید rustup نصب است اما در PATH نیست.
+  [[ -x "$HOME/.cargo/bin/cargo" ]] && export PATH="$HOME/.cargo/bin:$PATH"
+  if cargo_new_enough; then return 0; fi
+
+  local need="${MIN_RUST_MAJOR}.${MIN_RUST_MINOR}"
+  if have cargo; then
+    warn "cargoی موجود (نسخه‌ی $(cargo --version 2>/dev/null | awk '{print $2}')) قدیمی است؛ این پروژه به rustc >= ${need} نیاز دارد."
   fi
-  # تلاش برای نصب از پکیج‌منیجر، سپس fallback به rustup.
-  if pkg_install cargo rustc 2>/dev/null && have cargo; then return 0; fi
-  info "نصبِ زنجیره‌ی Rust از طریقِ rustup (غیرتعاملی) ..."
-  curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal \
-    || die "نصبِ rustup ناموفق بود؛ لطفاً Rust را دستی نصب کنید (https://rustup.rs)."
+  # NOTE: عمداً cargoی توزیع را نصب نمی‌کنیم چون معمولاً قدیمی است
+  # (مثلاً 1.75 که edition2024 را ندارد). از rustup پایدار استفاده می‌کنیم.
+  if have rustup; then
+    info "نصب/فعال‌سازیِ toolchainِ پایدار با rustup ..."
+    rustup toolchain install stable -q 2>/dev/null || true
+    rustup default stable 2>/dev/null || true
+  else
+    info "نصبِ rustup (stable, غیرتعاملی) ..."
+    curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain stable \
+      || die "نصبِ rustup ناموفق بود؛ لطفاً Rust >= ${need} را دستی نصب کنید (https://rustup.rs)."
+  fi
   export PATH="$HOME/.cargo/bin:$PATH"
-  have cargo || die "cargo پس از نصب هم در دسترس نیست."
+  cargo_new_enough \
+    || die "cargo >= ${need} در دسترس نشد. نسخه‌ی فعلی: $(cargo --version 2>/dev/null || echo 'نامشخص'). لطفاً با rustup پایدار را نصب کنید."
 }
 
 # --- واکشیِ سورس و بیلد -----------------------------------------------------
